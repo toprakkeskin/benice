@@ -13,19 +13,24 @@
 #        kernel_io_errors=N fs_errors=N psi_io_some_max=N psi_io_full_max=N
 #        sched=<elevator> status=OK|WARN [alerts="…"]
 #   When PSI stall triggers, "offenders:" and "action:" lines are appended
-#   separately after the per-disk lines.
+#   separately after the per-disk lines; demotion recovery emits "restored:"
+#   lines in the same style.
 #
-#   per-disk fields : in_flight, iops_read/write, util_pct, fs_errors,
-#                     sched, dev
+#   per-disk fields : in_flight, iops_read/write, busy_ms_delta, util_pct,
+#                     fs_errors, sched, dev
 #   global fields   : load*, iowait_pct, kernel_io_errors, psi_io_*_max
-#   status=MISSING  : configured disk not present in /sys/block (skipped run)
+#   status=MISSING  : configured disk not present in /sys/block (skipped run);
+#                     emitted with alerts="MISSING_DEV" plus an ALERT line
+#                     carrying that context (never a bare ALERT)
+#   status=WARN     : any alert fired, incl. MISSING_PSI (see below)
 #
 # Field reference (standard terminology):
 #   in_flight      /proc/diskstats field 12  — I/Os currently in progress
 #                   (queue depth snapshot; >8 sustained = device stalling)
 #   iops_read      reads/s over the interval (iostat "r/s")
 #   iops_write     writes/s over the interval (iostat "w/s")
-#   util_pct       device busy ms / interval — equivalent to iostat "%util"
+#   busy_ms_delta  device-busy milliseconds over the interval (the "%util"
+#                   numerator); util_pct = busy_ms_delta / interval
 #   iowait_pct     CPU time waiting for I/O (vmstat "wa")
 #   psi_io_*_max   peak /proc/pressure/io "some"/"full" avg10 sampled over the
 #                   window — CPU tasks stalled on I/O. full>25 sustained =
@@ -37,12 +42,38 @@
 #                   filesystem exposing /sys/fs/<fstype>/<part>/errors_count,
 #                   e.g. ext4) — filesystem-recorded errors
 #
+# PSI prerequisite: if /proc/pressure/io is unreadable, stall detection is
+# inactive — every emitted line gets status=WARN with MISSING_PSI in alerts
+# and one stderr/journal line explains it (see README Prerequisites). Device
+# health sampling still proceeds normally.
+#
 # THROTTLE: when psi_io_full_max >= PSI_TRIG, the top I/O consumers over the
 # window (from /proc/<pid>/io deltas) are logged as offN=… and — if
 # MITIGATE>=1 — demoted with `ionice -c3` + `renice 19`. Runs as root, so any
 # user's runaway process can be demoted (never PID 1/kernel threads).
+#   Time-normalized threshold (F4): a process qualifies when its window delta
+#   is >= IO_TRIG_MBPS MiB *per window* (MBPS * window seconds); the offN
+#   label therefore reports MiB per window, not MB/s.
+#   PID-reuse safety (F5): snapshots record /proc/<pid>/stat starttime
+#   (field 22, parsed after the last ')' — comm may contain spaces/parens)
+#   next to the pid; the A/B join requires BOTH to match, and every action
+#   re-reads the live starttime and skips on mismatch — a reused pid drops
+#   out instead of being acted on.
 #   NOTE on sched: ionice is fully honored only by BFQ. If the active elevator
 #   is mq-deadline, ionice is mostly cosmetic; renice still helps the CPU side.
+#
+# MITIGATE=2 pendulum (orphan-safe, F7): the intended frozen pid is recorded
+# in MSTATE BEFORE kill -STOP; an EXIT/TERM/INT trap SIGCONTs it, and the
+# start of every run SIGCONTs any recorded pid unconditionally — so even a
+# SIGKILLed run heals on the next run. The freeze therefore lasts at most
+# until the end of the run that issued it (bounded, never inter-run).
+#
+# Demotion recovery (F6): each demoted pid is stored as
+# "pid:starttime:orig_nice". After 2 consecutive clean runs (no PSI trigger),
+# every recorded pid that still exists (starttime-verified) is reniced back
+# to orig_nice and its ionice set to best-effort class 2 priority 4 (the
+# original ionice class is not readable back portably — best effort);
+# exited pids are dropped.
 #
 # ALERT rules (status=WARN, also emitted as a greppable "ALERT:" line):
 #   kernel_io_errors delta > 0        → device/kernel-level I/O failures
@@ -50,20 +81,40 @@
 #   in_flight > 8                     → device stalling
 #   util_pct > 80 over the interval   → saturated
 #   psi_io_full_max >= PSI_TRIG       → stall detected, offenders reported
+#   PSI unavailable                   → MISSING_PSI on every emitted line
 #
 # First run after a state reset logs status=BASELINE (no deltas, no alerts).
+#
+# State files (LIB_DIR, normally /var/lib/benice):
+#   state.<dev>      per-disk counters, 6 whitespace-separated fields:
+#                      <epoch> <uptime_s> <io_ms> <reads> <writes> <io_err>
+#                    uptime_s (/proc/uptime) is the monotonic interval source;
+#                    old 5-field files (no uptime_s) are read via the epoch
+#                    fallback and upgraded on the next write.
+#   mitigate.state   key=value lines (one per line), written every run:
+#                      last=<epoch>               last mitigation pass (cooldown)
+#                      stopped_pid=<pid>          pid frozen by MITIGATE=2 (0=none)
+#                      stopped_start=<starttime>  its /proc/<pid>/stat starttime
+#                      clean=<n>                  consecutive runs without trigger
+#                      demoted=<pid>:<starttime>:<orig_nice> …  space-separated
+#                    Pre-hardening files ("epoch pid" on one line) match no
+#                    key and are silently reset to defaults.
 #
 # Configuration: /etc/benice/benice.conf
 #   (template: config/benice.conf.example in the project repo)
 #   DISKS="sda"        space-separated list of block devices to watch
 #                      (deprecated alias: DEV=sda)
 #   PSI_TRIG=25        /proc/pressure/io "full avg10" % that counts as a stall
+#                      (clamped to a minimum of 1)
 #   PSI_WINDOW=30      seconds spent sampling PSI per run
 #   PSI_STEP=5         seconds between PSI samples
-#   IO_TRIG_MBPS=5     min MiB/s delta for a process to be reported/throttled
+#   IO_TRIG_MBPS=5     min MiB accumulated over the PSI window for a process
+#                      to be reported/throttled (time-normalized from MiB/s;
+#                      the log label shows MiB per window)
 #   MITIGATE=0|1|2     0 observe only · 1 ionice+renice offenders (default)
-#                      2 additionally SIGSTOP top offender / SIGCONT previous
-#                      (level 2 freezes the process — do NOT use on services!)
+#                      2 additionally SIGSTOP the top offender until the end
+#                      of the run (orphan-safe pendulum — see above; do NOT
+#                      use on services that must stay responsive!)
 #   COOLDOWN=300       minimum seconds between mitigation actions
 # =============================================================================
 set -u
@@ -85,35 +136,129 @@ IO_TRIG_MBPS=${IO_TRIG_MBPS:-5}
 MITIGATE=${MITIGATE:-1}
 COOLDOWN=${COOLDOWN:-300}
 
+# F11: clamp PSI_TRIG to >= 1 so the "0 >= 0" always-true seam is gone
+case $PSI_TRIG in ''|*[!0-9]*) PSI_TRIG=25 ;; esac
+[ "$PSI_TRIG" -lt 1 ] && PSI_TRIG=1
+case $IO_TRIG_MBPS in ''|*[!0-9]*) IO_TRIG_MBPS=5 ;; esac
+
 # ensure runtime dirs exist (self-healing; installer normally creates them)
 mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
+
+# --- /proc/<pid>/stat helpers -------------------------------------------------
+# comm (field 2) may contain spaces/parens — always parse AFTER the last ')'.
+# After the strip, positional N corresponds to kernel field N+2:
+#   field 19 (nice) -> ${17}, field 22 (starttime) -> ${20}.
+#   NB: braces are REQUIRED — $17/$20 would expand as ${1}+"7" / ${2}+"0".
+proc_starttime() {   # pid -> starttime (jiffies since boot); fails if gone
+  local s
+  s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  # shellcheck disable=SC2086  # intentional split on stat fields
+  set -- ${s##*) }
+  printf '%s\n' "${20}"   # NB: braced — $20 would mean ${2}+"0"
+}
+proc_nice() {        # pid -> current nice (field 19)
+  local s
+  s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  # shellcheck disable=SC2086  # intentional split on stat fields
+  set -- ${s##*) }
+  printf '%s\n' "${17}"   # NB: braced — $17 would mean ${1}+"7"
+}
+proc_alive() {       # pid starttime -> true iff pid exists AND starttime matches
+  [ -n "${2:-}" ] && [ "${2:-}" != "0" ] || return 1
+  local cur
+  cur=$(proc_starttime "$1") || return 1
+  [ "$cur" = "$2" ]
+}
+num_ok() { case ${1:-} in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+
+# --- mitigation state (format documented in the header) -----------------------
+MSTATE="$LIB_DIR/mitigate.state"
+m_last=0; m_stopped_pid=0; m_stopped_start=0; m_clean=0; m_demoted=""
+if [ -f "$MSTATE" ]; then
+  while IFS= read -r mline; do
+    case $mline in
+      last=*)          num_ok "${mline#last=}"          && m_last=${mline#last=} ;;
+      stopped_pid=*)   num_ok "${mline#stopped_pid=}"   && m_stopped_pid=${mline#stopped_pid=} ;;
+      stopped_start=*) num_ok "${mline#stopped_start=}" && m_stopped_start=${mline#stopped_start=} ;;
+      clean=*)         num_ok "${mline#clean=}"         && m_clean=${mline#clean=} ;;
+      demoted=*)       m_demoted=${mline#demoted=} ;;
+    esac
+  done < "$MSTATE"
+fi
+mstate_write() {
+  printf 'last=%s\nstopped_pid=%s\nstopped_start=%s\nclean=%s\ndemoted=%s\n' \
+    "$m_last" "$m_stopped_pid" "${m_stopped_start:-0}" "$m_clean" "$m_demoted" \
+    > "$MSTATE" 2>/dev/null || true
+}
+demoted_has() {      # pid starttime -> true if already on the demoted list
+  local e p s
+  # shellcheck disable=SC2086  # intentional word split over the list
+  for e in ${m_demoted:-}; do
+    p=${e%%:*}; s=${e#*:}; s=${s%%:*}
+    [ "$p" = "$1" ] && [ "$s" = "$2" ] && return 0
+  done
+  return 1
+}
+
+# F7: at the start of EVERY run, SIGCONT the previously recorded frozen pid
+# unconditionally (heals a SIGKILLed predecessor run; no-op otherwise).
+if [ "$m_stopped_pid" != "0" ] && proc_alive "$m_stopped_pid" "$m_stopped_start"; then
+  kill -CONT "$m_stopped_pid" 2>/dev/null || true
+fi
+m_stopped_pid=0; m_stopped_start=0    # re-recorded below if we freeze someone anew
+
+# F7: safety net — never leave a frozen process behind on exit/TERM/INT
+stopped_pid=0; stopped_start=0
+cleanup() {
+  if [ "$stopped_pid" != "0" ]; then
+    if proc_alive "$stopped_pid" "$stopped_start"; then
+      kill -CONT "$stopped_pid" 2>/dev/null || true
+    fi
+    m_stopped_pid=0; m_stopped_start=0
+    mstate_write
+  fi
+  rm -f "${TMP_A:-}" "${TMP_B:-}" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- collect GLOBAL counters ---------------------------------------------------
 now=$(date '+%F %T')
 epoch=$(date +%s)
+up_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)  # F9: monotonic clock
+num_ok "$up_now" || up_now=0
 load1=$(cut -d' ' -f1 /proc/loadavg); load5=$(cut -d' ' -f2 /proc/loadavg); load15=$(cut -d' ' -f3 /proc/loadavg)
 ioerr=$(journalctl -k --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
 iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=${iowait_pct:-0}
 
 # --- I/O per-process snapshot helper -----------------------------------------
-# outputs "pid total_bytes" lines (root can read every process)
+# outputs "pid starttime total_bytes" lines (root can read every process);
+# the starttime column makes the A/B join PID-reuse-proof (F5)
 snap_io() {
-  local p pid b
+  local p pid b st
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     [ "$pid" = "$$" ] && continue
     [ "$pid" -le 2 ] && continue          # skip PID 1 and kernel threads
+    st=$(proc_starttime "$pid") || continue
     b=$(awk '/^(read|write)_bytes/{s+=$2} END{print s+0}' "$p/io" 2>/dev/null) || continue
-    [ "${b:-0}" -gt 0 ] && printf '%s %s\n' "$pid" "$b"
+    [ "${b:-0}" -gt 0 ] && printf '%s %s %s\n' "$pid" "$st" "$b"
   done
 }
 TMP_A=$(mktemp) ; TMP_B=$(mktemp)
-trap 'rm -f "$TMP_A" "$TMP_B"' EXIT
+
+# F4: bracket the sampling window so the offender threshold is time-normalized
+win_start=$(date +%s)
 snap_io > "$TMP_A"
 
 # --- PSI sampling window ------------------------------------------------------
 psi_max_some=0; psi_max_full=0
-if [ -r /proc/pressure/io ]; then
+psi_ok=1
+if [ ! -r /proc/pressure/io ]; then
+  psi_ok=0    # F1: stall detection inactive — say so, loudly
+  echo "beniced: PSI unavailable — stall detection inactive (see README Prerequisites)" >&2
+else
   waited=0
   while :; do
     s=$(awk '/^some/{v=$2} /^full/{f=$2} END{sub("avg10=","",v); sub("avg10=","",f); printf "%d %d", v+0, f+0}' /proc/pressure/io)
@@ -125,29 +270,33 @@ if [ -r /proc/pressure/io ]; then
   done
 fi
 snap_io > "$TMP_B"
+win_end=$(date +%s)
+win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1
 
 # --- offender ranking over the window (global, process-level) -----------------
-tops=$(awk 'NR==FNR{a[$1]=$2; next} $1 in a {d=$2-a[$1]; if(d>0) printf "%d %s\n", d, $1}' "$TMP_A" "$TMP_B" \
-       | sort -rn | head -3)
+# join requires pid AND starttime to match — a reused pid drops out (F5)
+tops=$(awk 'NR==FNR{a[$1]=$3; st[$1]=$2; next}
+            ($1 in a) && ($2 == st[$1]) {d=$3-a[$1]; if(d>0) printf "%d %s:%s\n", d, $1, $2}' \
+       "$TMP_A" "$TMP_B" | sort -rn | head -3)
 trig=0
 [ "$psi_max_full" -ge "$PSI_TRIG" ] && trig=1
+
+# F6: consecutive clean runs counter — drives demotion recovery
+if [ "$trig" -eq 0 ]; then m_clean=$((m_clean + 1)); else m_clean=0; fi
 
 # --- fs error count for one disk = sum over its partitions --------------------
 fs_err_of() {
   local dev=$1 total=0 pcnt f
   for pcnt in $(ls "/sys/block/$dev" 2>/dev/null | grep "^$dev"); do
-    for f in /sys/fs/*/\"$pcnt\"/errors_count; do
+    for f in /sys/fs/*/"$pcnt"/errors_count; do     # F2: no literal \" escapes
       [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
     done
   done
-  for f in /sys/fs/*/\"$dev\"/errors_count; do   # whole-device filesystem (rare)
+  for f in /sys/fs/*/"$dev"/errors_count; do        # whole-device filesystem (rare)
     [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
   done
   echo "$total"
 }
-
-# --- mitigation state ----------------------------------------------------------
-MSTATE="$LIB_DIR/mitigate.state"
 
 # --- PER-DISK pass: emit one line per configured device ------------------------
 any_warn=0
@@ -155,9 +304,13 @@ any_warn=0
 for dev in $DISKS; do
 
   if [ ! -d "/sys/block/$dev" ]; then
-    line=$(printf '%s dev=%s status=MISSING' "$now" "$dev")
+    # F10: the ALERT context travels on the line itself — never a bare ALERT
+    miss_alerts="MISSING_DEV"
+    [ "$psi_ok" -eq 0 ] && miss_alerts="MISSING_DEV MISSING_PSI"
+    line=$(printf '%s dev=%s status=MISSING alerts="%s"' "$now" "$dev" "$miss_alerts")
     echo "$line" >> "$LOG"; echo "$line"
-    any_warn=1
+    echo "ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\"" >> "$LOG"
+    echo "ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\""
     continue
   fi
 
@@ -170,11 +323,29 @@ for dev in $DISKS; do
   sfile="$LIB_DIR/state.$dev"
   status=OK
   alerts=""
+  busy_delta=0
   if [ -f "$sfile" ]; then
-    read -r p_epoch p_io p_rd p_wr p_err < "$sfile" 2>/dev/null || true
-    p_epoch=${p_epoch:-0}; p_io=${p_io:-0}; p_rd=${p_rd:-0}; p_wr=${p_wr:-0}; p_err=${p_err:-0}
-    wall_s=$(( epoch - p_epoch )); [ "$wall_s" -lt 1 ] && wall_s=1
-    util_pct=$(( io_ms > p_io ? (io_ms - p_io) * 100 / (wall_s * 1000) : 0 ))
+    # F9: 6 fields since the uptime column; old 5-field files use epoch fallback
+    read -r -a srow < "$sfile" 2>/dev/null || srow=()
+    if [ "${#srow[@]}" -ge 6 ] && num_ok "${srow[1]}"; then
+      p_epoch=${srow[0]}; p_up=${srow[1]}; p_io=${srow[2]}
+      p_rd=${srow[3]}; p_wr=${srow[4]}; p_err=${srow[5]}
+    else
+      p_epoch=${srow[0]:-0}; p_up=0; p_io=${srow[1]:-0}
+      p_rd=${srow[2]:-0}; p_wr=${srow[3]:-0}; p_err=${srow[4]:-0}
+    fi
+    for v in p_epoch p_io p_rd p_wr p_err; do
+      num_ok "${!v}" || printf -v "$v" '%s' 0
+    done
+    # monotonic wall time from /proc/uptime when available (clock-jump proof)
+    if [ "$p_up" -gt 0 ] && [ "$up_now" -ge "$p_up" ]; then
+      wall_s=$(( up_now - p_up ))
+    else
+      wall_s=$(( epoch - p_epoch ))     # legacy fallback
+    fi
+    [ "$wall_s" -lt 1 ] && wall_s=1
+    busy_delta=$(( io_ms > p_io ? io_ms - p_io : 0 ))   # F3: real delta
+    util_pct=$(( busy_delta * 100 / (wall_s * 1000) ))
     [ "$util_pct" -gt 100 ] && util_pct=100
     d_rd=$(( rd > p_rd ? rd - p_rd : 0 ))
     d_wr=$(( ws > p_wr ? ws - p_wr : 0 ))
@@ -188,31 +359,36 @@ for dev in $DISKS; do
   else
     iops_r=0; iops_w=0; util_pct=0   # BASELINE run for this disk
   fi
-  printf '%s %s %s %s %s\n' "$epoch" "$io_ms" "$rd" "$ws" "$ioerr" > "$sfile"
+  printf '%s %s %s %s %s %s\n' "$epoch" "$up_now" "$io_ms" "$rd" "$ws" "$ioerr" > "$sfile" 2>/dev/null || true
 
   if [ "$trig" -eq 1 ]; then
     alerts="${alerts:+$alerts }PSI_HIGH=${psi_max_full}%"; status=WARN
   fi
+  # F1: PSI missing → WARN + MISSING_PSI on every emitted line
+  if [ "$psi_ok" -eq 0 ]; then
+    alerts="${alerts:+$alerts }MISSING_PSI"; status=WARN
+  fi
   [ "$status" = "WARN" ] && any_warn=1
 
   line=$(printf '%s dev=%s load_1m=%s load_5m=%s load_15m=%s in_flight=%d iops_read=%s iops_write=%s busy_ms_delta=%dms util_pct=%d iowait_pct=%s kernel_io_errors=%d fs_errors=%d psi_io_some_max=%d psi_io_full_max=%d sched=%s status=%s' \
-    "$now" "$dev" "$load1" "$load5" "$load15" "$ifl" "$iops_r" "$iops_w" 0 "$util_pct" "$iowait_pct" "$ioerr" "$fs_err" "$psi_max_some" "$psi_max_full" "$sched" "$status")
+    "$now" "$dev" "$load1" "$load5" "$load15" "$ifl" "$iops_r" "$iops_w" "$busy_delta" "$util_pct" "$iowait_pct" "$ioerr" "$fs_err" "$psi_max_some" "$psi_max_full" "$sched" "$status")
   [ -n "$alerts" ] && line="$line alerts=\"$alerts\""
-  echo "$line" >> "$LOG"
-  echo "$line"
+  echo "$line" >> "$LOG"; echo "$line"
 done
 
 # --- offender reporting + reactive mitigation (global, process-level) ---------
 off_list=""; act=""
+restored_lines=()
+min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 * win_s ))   # F4: MiB per window
+reported=0
 if [ "$trig" -eq 1 ]; then
-  min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 ))
-  reported=0
-  while read -r d pid; do
-    [ -r "/proc/$pid/comm" ] || continue
+  while read -r d pentry; do
+    pid=${pentry%%:*}; pstart=${pentry##*:}
     [ "$d" -lt "$min_bytes" ] && continue
+    [ -r "/proc/$pid/comm" ] || continue
     mb=$(( d / (1024 * 1024) ))
-    comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -d ' ')
-    off_list="${off_list:+$off_list }off$((reported+1))=${pid}:${comm_name}:${mb}MBps"
+    comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')  # F8
+    off_list="${off_list:+$off_list }off$((reported+1))=${pid}:${comm_name}:${mb}MiB"
     reported=$((reported + 1))
   done <<EOF
 $tops
@@ -220,24 +396,32 @@ EOF
 fi
 
 if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
-  last=0; stopped_pid=""
-  [ -f "$MSTATE" ] && read -r last stopped_pid < "$MSTATE" 2>/dev/null || true
   acted=0; acted_pids=""
-  if [ $(( epoch - last )) -ge "$COOLDOWN" ]; then
-    if [ "$MITIGATE" -ge 2 ] && [ -n "$stopped_pid" ] && [ "$stopped_pid" != "0" ]; then
-      kill -CONT "$stopped_pid" 2>/dev/null && act="SIGCONT:$stopped_pid"
-    fi
-    while read -r d pid; do
-      [ -r "/proc/$pid/comm" ] || continue
-      [ "$d" -lt "$min_bytes" ] && continue
+  if [ $(( epoch - m_last )) -ge "$COOLDOWN" ]; then
+    while read -r d pentry; do
+      pid=${pentry%%:*}; pstart=${pentry##*:}
       [ "$pid" -le 2 ] && continue
+      [ "$d" -lt "$min_bytes" ] && continue
+      proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
+      [ -r "/proc/$pid/comm" ] || continue
       if [ "$MITIGATE" -ge 1 ]; then
+        # F6: remember the original nice once, so it can be restored later
+        if ! demoted_has "$pid" "$pstart"; then
+          onice=$(proc_nice "$pid"); num_ok "$onice" || onice=0
+          m_demoted="${m_demoted:+$m_demoted }$pid:$pstart:$onice"
+        fi
         ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
           && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
       fi
       if [ "$MITIGATE" -ge 2 ]; then
-        kill -STOP "$pid" 2>/dev/null && stopped_pid=$pid
-        break   # pendulum: keep at most one process frozen between runs
+        stopped_pid=$pid; stopped_start=$pstart
+        m_stopped_pid=$pid; m_stopped_start=$pstart
+        mstate_write                             # F7: record BEFORE the STOP
+        kill -STOP "$pid" 2>/dev/null || {
+          stopped_pid=0; stopped_start=0; m_stopped_pid=0; m_stopped_start=0
+          mstate_write                       # revert the pre-STOP record
+        }
+        break   # pendulum: at most one process frozen per run
       fi
     done <<EOF
 $tops
@@ -246,22 +430,39 @@ EOF
       act="${act:+$act }ionice+renice pids=$acted_pids"
       act="$act (ionice fully binding only under bfq)"
     fi
-    printf '%s %s\n' "$epoch" "${stopped_pid:-0}" > "$MSTATE"
+    m_last=$epoch
   else
-    act="cooldown $(( COOLDOWN - (epoch - last) ))s"
-  fi
-elif [ "$MITIGATE" -ge 2 ] && [ -f "$MSTATE" ]; then
-  read -r last stopped_pid < "$MSTATE" 2>/dev/null || true
-  if [ -n "${stopped_pid:-}" ] && [ "$stopped_pid" != "0" ]; then
-    kill -CONT "$stopped_pid" 2>/dev/null && printf '%s 0\n' "$epoch" > "$MSTATE"
+    act="cooldown $(( COOLDOWN - (epoch - m_last) ))s"
   fi
 fi
 
-# --- append offender/action lines to this run's log ----------------------------
-if [ -n "$off_list" ] || [ -n "$act" ]; then
-  [ -n "$off_list" ] && { echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; }
-  [ -n "$act" ]      && { echo "action: $act" >> "$LOG"; echo "action: $act"; }
+# --- demotion recovery (F6): after 2 consecutive clean runs, restore ----------
+if [ "$trig" -eq 0 ] && [ "$m_clean" -ge 2 ] && [ -n "$m_demoted" ]; then
+  for entry in $m_demoted; do
+    rpid=${entry%%:*}; rrest=${entry#*:}; rstart=${rrest%%:*}; rnice=${rrest##*:}
+    if ! proc_alive "$rpid" "$rstart"; then
+      continue                                   # exited — just drop it
+    fi
+    if renice -n "$rnice" -p "$rpid" >/dev/null 2>&1; then
+      ionice -c 2 -n 4 -p "$rpid" >/dev/null 2>&1 || true   # best-effort
+      restored_lines+=("restored: pid=$rpid nice=$rnice")
+    else
+      restored_lines+=("restore failed: pid=$rpid nice=$rnice")
+    fi
+  done
+  m_demoted=""
 fi
+
+# --- append offender/action/restored lines to this run's log -------------------
+if [ -n "$off_list" ]; then echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; fi
+if [ -n "$act" ]; then echo "action: $act" >> "$LOG"; echo "action: $act"; fi
+if [ "${#restored_lines[@]}" -gt 0 ]; then
+  printf '%s\n' "${restored_lines[@]}" >> "$LOG"
+  printf '%s\n' "${restored_lines[@]}"
+fi
+
+# persist mitigation state (single writer point at end of run)
+mstate_write
 
 [ "$any_warn" -eq 1 ] && echo "ALERT: see status=WARN lines above"
 exit 0

@@ -4,11 +4,13 @@
 #
 # What it does:
 #   1. installs the sampler binary to /usr/local/sbin/beniced
-#   2. creates /etc/benice, /var/lib/benice, /var/log/benice
+#   2. creates /etc/benice, /var/lib/benice, /var/log/benice and installs a
+#      logrotate stanza for the log (/etc/logrotate.d/benice)
 #   3. installs the central config /etc/benice/benice.conf
 #      (never overwrites an existing config — only sets the DISKS= line)
 #   4. interactively asks which disks to watch (or accepts --disks "sda sdb",
-#      or falls back to the root disk when non-interactive)
+#      or falls back to the root disk when non-interactive); warns when PSI
+#      (/proc/pressure/io) is unavailable — stall detection needs psi=1
 #   5. installs systemd units (system-wide, user-independent) and enables
 #      the 5-minute timer
 #
@@ -30,6 +32,7 @@ CONF_DIR=/etc/benice
 CONF_DST=$CONF_DIR/benice.conf
 LIB_DIR=/var/lib/benice
 LOG_DIR=/var/log/benice
+LOGROTATE_DST=/etc/logrotate.d/benice
 UNIT_DIR=/etc/systemd/system
 
 # ---------------------------------------------------------------- parse args
@@ -50,12 +53,49 @@ install -m 0755 "$SRC_DIR/bin/beniced" "$BIN_DST"
 echo "==> [2/5] creating runtime directories"
 install -d -m 0755 "$CONF_DIR" "$LIB_DIR" "$LOG_DIR"
 
+# log rotation for the append-only log (weekly, keep 8, no daemon restart
+# needed thanks to copytruncate). Idempotent: never clobber a user-customized
+# stanza — only write it when absent.
+if [[ -f $LOGROTATE_DST ]]; then
+  echo "    logrotate stanza already exists — keeping $LOGROTATE_DST"
+else
+  cat > "$LOGROTATE_DST" <<'EOF'
+/var/log/benice/benice.log {
+    weekly
+    rotate 8
+    copytruncate
+    compress
+    missingok
+    notifempty
+}
+EOF
+  chmod 0644 "$LOGROTATE_DST"   # root:root by construction (script requires root)
+  echo "    installed logrotate stanza: $LOGROTATE_DST"
+fi
+
 echo "==> [3/5] installing central config to $CONF_DST"
 if [[ -f $CONF_DST ]]; then
   echo "    already exists — keeping current config (DISKS line will be updated)"
 else
   install -m 0644 "$SRC_DIR/config/benice.conf.example" "$CONF_DST"
   echo "    installed default template (all knobs commented out)"
+fi
+
+# ---------------------------------------------------------------- PSI check
+# Stall detection needs PSI (/proc/pressure/io). Raspberry Pi OS ships with
+# PSI disabled by default — the fix is psi=1 on the kernel cmdline + reboot.
+# Health sampling works without PSI, so warn prominently and continue.
+PSI_PATH=${PSI_PATH:-/proc/pressure/io}
+if [[ ! -r $PSI_PATH ]]; then
+  {
+    echo
+    echo "  **************************************************************************************"
+    echo "  *  WARNING: PSI is not available on this kernel — stall detection will stay inactive."
+    echo "  *  FIX: append psi=1 to /boot/firmware/cmdline.txt and reboot."
+    echo "  *  (health sampling still works without PSI)"
+    echo "  **************************************************************************************"
+    echo
+  } >&2
 fi
 
 # ------------------------------------------------- step 4: disk selection
@@ -165,7 +205,8 @@ echo
 echo "Done. beniced (BeNice) is installed system-wide."
 echo "  binary : $BIN_DST"
 echo "  config : $CONF_DST  (DISKS=\"$SELECTED\")"
-echo "  log    : $LOG_DIR/benice.log"
+echo "  log    : $LOG_DIR/benice.log  (logrotate: $LOGROTATE_DST)"
+echo "  psi    : $( [[ -r $PSI_PATH ]] && echo available || echo 'NOT available — stall detection inactive' )"
 echo "  state  : $LIB_DIR/"
 echo "  timer  : $(systemctl is-enabled beniced.timer 2>/dev/null) ($(systemctl is-active beniced.timer 2>/dev/null))"
 echo

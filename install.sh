@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — system-wide installer for disk-watch
+# install.sh — system-wide installer for beniced (BeNice)
 #
 # What it does:
-#   1. installs the sampler binary to /usr/local/sbin/disk-watch
-#   2. creates /etc/disk-watch, /var/lib/disk-watch, /var/log/disk-watch
-#   3. installs the central config /etc/disk-watch/disk-watch.conf
+#   1. installs the sampler binary to /usr/local/sbin/beniced
+#   2. creates /etc/benice, /var/lib/benice, /var/log/benice
+#   3. installs the central config /etc/benice/benice.conf
 #      (never overwrites an existing config — only sets the DISKS= line)
 #   4. interactively asks which disks to watch (or accepts --disks "sda sdb",
 #      or falls back to the root disk when non-interactive)
@@ -25,11 +25,11 @@ fi
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-BIN_DST=/usr/local/sbin/disk-watch
-CONF_DIR=/etc/disk-watch
-CONF_DST=$CONF_DIR/disk-watch.conf
-LIB_DIR=/var/lib/disk-watch
-LOG_DIR=/var/log/disk-watch
+BIN_DST=/usr/local/sbin/beniced
+CONF_DIR=/etc/benice
+CONF_DST=$CONF_DIR/benice.conf
+LIB_DIR=/var/lib/benice
+LOG_DIR=/var/log/benice
 UNIT_DIR=/etc/systemd/system
 
 # ---------------------------------------------------------------- parse args
@@ -45,7 +45,7 @@ done
 
 # ---------------------------------------------------------------- steps 1-3
 echo "==> [1/5] installing binary to $BIN_DST"
-install -m 0755 "$SRC_DIR/disk-watch" "$BIN_DST"
+install -m 0755 "$SRC_DIR/bin/beniced" "$BIN_DST"
 
 echo "==> [2/5] creating runtime directories"
 install -d -m 0755 "$CONF_DIR" "$LIB_DIR" "$LOG_DIR"
@@ -54,7 +54,7 @@ echo "==> [3/5] installing central config to $CONF_DST"
 if [[ -f $CONF_DST ]]; then
   echo "    already exists — keeping current config (DISKS line will be updated)"
 else
-  install -m 0644 "$SRC_DIR/examples/disk-watch.conf.example" "$CONF_DST"
+  install -m 0644 "$SRC_DIR/config/benice.conf.example" "$CONF_DST"
   echo "    installed default template (all knobs commented out)"
 fi
 
@@ -135,17 +135,17 @@ printf 'DISKS="%s"\n' "$SELECTED" >> "$CONF_DST"
 
 # ---------------------------------------------------------------- step 5
 echo "==> [5/5] installing systemd units and enabling the timer"
-install -m 0644 "$SRC_DIR/systemd/disk-watch.service" "$UNIT_DIR/disk-watch.service"
-install -m 0644 "$SRC_DIR/systemd/disk-watch.timer"   "$UNIT_DIR/disk-watch.timer"
+install -m 0644 "$SRC_DIR/systemd/beniced.service" "$UNIT_DIR/beniced.service"
+install -m 0644 "$SRC_DIR/systemd/beniced.timer"   "$UNIT_DIR/beniced.timer"
 systemctl daemon-reload
-systemctl enable --now disk-watch.timer
+systemctl enable --now beniced.timer
 
 # resolve the next elapse via the systemd bus (raw microseconds):
 #   On*Sec (monotonic) timers -> NextElapseUSecMonotonic (µs since boot)
 #   OnCalendar (realtime) ones -> NextElapseUSecRealtime (µs since epoch)
 # Right after a trigger both can be transiently unset — hence the fallback.
 next_run() {
-  local unit=disk-watch.timer
+  local unit=beniced.timer
   local path="/org/freedesktop/systemd1/unit/${unit//./_2e}"
   path=${path//-/_2d}
   local mono rt up_us
@@ -162,11 +162,11 @@ next_run() {
 }
 
 echo
-echo "Done. disk-watch is installed system-wide."
+echo "Done. beniced (BeNice) is installed system-wide."
 echo "  binary : $BIN_DST"
 echo "  config : $CONF_DST  (DISKS=\"$SELECTED\")"
-echo "  log    : $LOG_DIR/disk-watch.log"
+echo "  log    : $LOG_DIR/benice.log"
 echo "  state  : $LIB_DIR/"
-echo "  timer  : $(systemctl is-enabled disk-watch.timer 2>/dev/null) ($(systemctl is-active disk-watch.timer 2>/dev/null))"
+echo "  timer  : $(systemctl is-enabled beniced.timer 2>/dev/null) ($(systemctl is-active beniced.timer 2>/dev/null))"
 echo
 echo "Next run: $(next_run)"

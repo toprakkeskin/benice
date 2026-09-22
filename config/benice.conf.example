@@ -1,9 +1,9 @@
-# /etc/disk-watch/disk-watch.conf — disk-watch configuration
-# Sourced by the disk-watch script on every run. All values below are the
-# defaults; uncomment a line to override.
+# /etc/benice/benice.conf — BeNice configuration
+# Sourced by beniced on every run. All values below are the defaults;
+# uncomment a line to override.
 
-# Block device to sample
-#DEV=sda
+# Block devices to watch (space-separated list)
+#DISKS="sda"
 
 # /proc/pressure/io "full avg10" percentage above which a stall is declared
 #PSI_TRIG=25

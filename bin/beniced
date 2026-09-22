@@ -1,7 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# disk-watch — block device health sampler + PSI stall detector
-#              + reactive throttle (multi-disk capable)
+# beniced — block device health sampler + PSI stall detector
+#           + reactive throttle (multi-disk capable)          [ the BeNice sampler ]
+#
+# System-wide service (runs as root, user-independent). Watches ONE OR MORE
+# block devices (DISKS in /etc/benice/benice.conf) and emits one log
+# line per disk per run.
 #
 # Log line format (key=value, machine-parseable; ONE LINE PER DISK per run):
 #   <ts> dev=sda load_1m=N load_5m=N load_15m=N in_flight=N iops_read=N
@@ -49,8 +53,8 @@
 #
 # First run after a state reset logs status=BASELINE (no deltas, no alerts).
 #
-# Configuration: /etc/disk-watch/disk-watch.conf
-#   (template: examples/disk-watch.conf.example in the project repo)
+# Configuration: /etc/benice/benice.conf
+#   (template: config/benice.conf.example in the project repo)
 #   DISKS="sda"        space-separated list of block devices to watch
 #                      (deprecated alias: DEV=sda)
 #   PSI_TRIG=25        /proc/pressure/io "full avg10" % that counts as a stall
@@ -63,13 +67,13 @@
 #   COOLDOWN=300       minimum seconds between mitigation actions
 # =============================================================================
 set -u
-CONF="/etc/disk-watch/disk-watch.conf"
+CONF="/etc/benice/benice.conf"
 [ -r "$CONF" ] && . "$CONF"
 
 # test/CI seams: directories can be redirected without touching the config
-LOG_DIR=${DISK_WATCH_LOG_DIR:-/var/log/disk-watch}
-LIB_DIR=${DISK_WATCH_LIB_DIR:-/var/lib/disk-watch}
-LOG="$LOG_DIR/disk-watch.log"
+LOG_DIR=${BENICE_LOG_DIR:-/var/log/benice}
+LIB_DIR=${BENICE_LIB_DIR:-/var/lib/benice}
+LOG="$LOG_DIR/benice.log"
 
 # disks to watch: DISKS = space-separated list (DEV kept as deprecated alias)
 DISKS=${DISKS:-${DEV:-sda}}
@@ -83,12 +87,6 @@ COOLDOWN=${COOLDOWN:-300}
 
 # ensure runtime dirs exist (self-healing; installer normally creates them)
 mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
-
-# --- migrate legacy single-disk state (pre-multi-disk releases) ---------------
-first_dev=${DISKS%% *}
-if [ -f "$LIB_DIR/state" ] && [ ! -f "$LIB_DIR/state.$first_dev" ]; then
-  mv "$LIB_DIR/state" "$LIB_DIR/state.$first_dev"
-fi
 
 # --- collect GLOBAL counters ---------------------------------------------------
 now=$(date '+%F %T')
@@ -138,11 +136,11 @@ trig=0
 fs_err_of() {
   local dev=$1 total=0 pcnt f
   for pcnt in $(ls "/sys/block/$dev" 2>/dev/null | grep "^$dev"); do
-    for f in /sys/fs/*/"$pcnt"/errors_count; do
+    for f in /sys/fs/*/\"$pcnt\"/errors_count; do
       [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
     done
   done
-  for f in /sys/fs/*/"$dev"/errors_count; do   # whole-device filesystem (rare)
+  for f in /sys/fs/*/\"$dev\"/errors_count; do   # whole-device filesystem (rare)
     [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
   done
   echo "$total"
@@ -191,6 +189,7 @@ for dev in $DISKS; do
     iops_r=0; iops_w=0; util_pct=0   # BASELINE run for this disk
   fi
   printf '%s %s %s %s %s\n' "$epoch" "$io_ms" "$rd" "$ws" "$ioerr" > "$sfile"
+
   if [ "$trig" -eq 1 ]; then
     alerts="${alerts:+$alerts }PSI_HIGH=${psi_max_full}%"; status=WARN
   fi
@@ -258,7 +257,7 @@ elif [ "$MITIGATE" -ge 2 ] && [ -f "$MSTATE" ]; then
   fi
 fi
 
-# --- append offender/action fields to this run's log lines --------------------
+# --- append offender/action lines to this run's log ----------------------------
 if [ -n "$off_list" ] || [ -n "$act" ]; then
   [ -n "$off_list" ] && { echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; }
   [ -n "$act" ]      && { echo "action: $act" >> "$LOG"; echo "action: $act"; }

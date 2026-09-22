@@ -1,13 +1,15 @@
-# disk-watch
+# benice
 
-A small systemd service that watches the disks on a Linux box, notices when
-something is grinding them into the ground, works out which process is doing
-it, and pushes that process to the back of the queue before the whole machine
-falls over.
+*"BeNice" — because something on your box is always being mean to your disk.*
 
-It is one bash script and one systemd timer. No daemons, no agents, no
-databases. It works on any block device — `sda`, `nvme0n1`, whatever you
-have — and you can watch several at once.
+A small systemd service that watches the disks on a Linux machine, notices
+when something is grinding them into the ground, works out which process is
+doing it, and pushes that process to the back of the queue before the whole
+machine falls over.
+
+It is one bash script (`beniced`) and one systemd timer. No agents, no
+databases, no telemetry. Works on any block device — `sda`, `nvme0n1`,
+whatever you have — and you can watch several at once.
 
 **Author:** Toprak Keskin · [github.com/toprakkeskin](https://github.com/toprakkeskin)
 
@@ -34,7 +36,7 @@ goes down. That is what you are looking at.
 
 ## How it works
 
-Every 5 minutes the timer fires and the sampler does this:
+Every 5 minutes the timer fires and `beniced` does this:
 
 1. Reads device counters from `/proc/diskstats` (IOPS, busy time, in-flight
    requests), plus load, iowait and error counters.
@@ -49,7 +51,7 @@ Every 5 minutes the timer fires and the sampler does this:
    every queue they are standing in.
 
 Everything is one `key=value` line per disk in a plain log file. No
-telemetry, no dashboard required.
+dashboard required.
 
 ## Installation
 
@@ -72,18 +74,18 @@ touches your existing config.
 
 | Path | Purpose |
 |---|---|
-| `/usr/local/sbin/disk-watch` | the sampler itself |
-| `/etc/disk-watch/disk-watch.conf` | central configuration (survives upgrades) |
-| `/var/log/disk-watch/disk-watch.log` | one `key=value` line per disk, per run |
-| `/var/lib/disk-watch/state.<dev>` | per-disk counters between runs, for deltas |
-| `/var/lib/disk-watch/mitigate.state` | throttle bookkeeping (cooldowns, frozen pid) |
-| `/etc/systemd/system/disk-watch.service` | oneshot unit, runs as root |
-| `/etc/systemd/system/disk-watch.timer` | fires it every 5 minutes |
+| `/usr/local/sbin/beniced` | the sampler itself |
+| `/etc/benice/benice.conf` | central configuration (survives upgrades) |
+| `/var/log/benice/benice.log` | one `key=value` line per disk, per run |
+| `/var/lib/benice/state.<dev>` | per-disk counters between runs, for deltas |
+| `/var/lib/benice/mitigate.state` | throttle bookkeeping (cooldowns, frozen pid) |
+| `/etc/systemd/system/beniced.service` | oneshot unit, runs as root |
+| `/etc/systemd/system/beniced.timer` | fires it every 5 minutes |
 
 ## Configuration
 
-Edit `/etc/disk-watch/disk-watch.conf`. Changes apply on the next run — the
-file is sourced fresh every time, no restart needed.
+Edit `/etc/benice/benice.conf`. Changes apply on the next run — the file is
+sourced fresh every time, no restart needed.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -122,14 +124,14 @@ sudo ./uninstall.sh --purge   # also removes config, logs and state
 - `MITIGATE=2` freezes the top offender between runs (SIGSTOP, then SIGCONT).
   It works, but do not enable it if a database or server could ever be
   flagged.
-- The sampler runs as root, because it needs to see and throttle every
-  user's processes. It refuses to touch PID 1 and kernel threads.
+- `beniced` runs as root, because it needs to see and throttle every user's
+  processes. It refuses to touch PID 1 and kernel threads.
 - Requires: Linux with PSI support (kernel 4.20+, enabled by default on most
   modern distros), systemd, bash, and the usual coreutils. Nothing else.
 
 ## License
 
-MIT — do whatever you want with it.
+MIT — see [LICENSE](LICENSE).
 
 ## Author
 

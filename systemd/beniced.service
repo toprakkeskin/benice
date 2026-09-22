@@ -1,11 +1,10 @@
 [Unit]
-Description=disk-watch — block device health sampler + PSI stall detector + reactive I/O throttle
-Documentation=file:///usr/local/share/doc/disk-watch/README.md
+Description=beniced (BeNice) — block device health sampler + PSI stall detector + reactive I/O throttle
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/disk-watch
+ExecStart=/usr/local/sbin/beniced
 # the sampler itself must never contribute to the pressure it measures
 Nice=10
 IOSchedulingClass=idle

@@ -10,5 +10,19 @@ Nice=10
 IOSchedulingClass=idle
 IOSchedulingPriority=7
 
+# --- hardening -------------------------------------------------------------
+# no setuid/sudo escalation from inside the unit
+NoNewPrivileges=yes
+# entire filesystem hierarchy read-only; /proc and /sys stay readable (sampler)
+ProtectSystem=strict
+# the only places beniced may write: its state and its logs
+ReadWritePaths=/var/log/benice /var/lib/benice
+# script uses mktemp and never shares temp files across services
+PrivateTmp=yes
+# sampler never touches /home or /root
+ProtectHome=yes
+# state/log files created group-readable only, not world-writable
+UMask=0027
+
 [Install]
 WantedBy=multi-user.target

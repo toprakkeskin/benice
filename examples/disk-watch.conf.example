@@ -1,0 +1,27 @@
+# /etc/disk-watch/disk-watch.conf — disk-watch configuration
+# Sourced by the disk-watch script on every run. All values below are the
+# defaults; uncomment a line to override.
+
+# Block device to sample
+#DEV=sda
+
+# /proc/pressure/io "full avg10" percentage above which a stall is declared
+#PSI_TRIG=25
+
+# PSI sampling window (seconds) and step between samples
+#PSI_WINDOW=30
+#PSI_STEP=5
+
+# Minimum MiB/s delta for a process to be reported/throttled as an offender
+#IO_TRIG_MBPS=5
+
+# Mitigation level:
+#   0 = observe only (log offenders, take no action)
+#   1 = demote offenders: ionice -c3 + renice 19  (default, safe)
+#   2 = additionally SIGSTOP the top offender and SIGCONT it on the next run.
+#       WARNING: freezes the process — never enable for services that must
+#       stay responsive (databases, servers, …)
+#MITIGATE=1
+
+# Minimum seconds between two mitigation actions
+#COOLDOWN=300

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run disk-watch every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=disk-watch.service
+
+[Install]
+WantedBy=timers.target

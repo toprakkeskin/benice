@@ -1,0 +1,15 @@
+[Unit]
+Description=disk-watch — USB SSD health sampler + PSI stall detector + reactive I/O throttle
+Documentation=file:///usr/local/share/doc/disk-watch/README.md
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/disk-watch
+# the sampler itself must never contribute to the pressure it measures
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

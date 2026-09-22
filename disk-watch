@@ -1,0 +1,268 @@
+#!/bin/bash
+# =============================================================================
+# disk-watch — block device health sampler + PSI stall detector
+#              + reactive throttle (multi-disk capable)
+#
+# Log line format (key=value, machine-parseable; ONE LINE PER DISK per run):
+#   <ts> dev=sda load_1m=N load_5m=N load_15m=N in_flight=N iops_read=N
+#        iops_write=N busy_ms_delta=Nms util_pct=N iowait_pct=N
+#        kernel_io_errors=N fs_errors=N psi_io_some_max=N psi_io_full_max=N
+#        sched=<elevator> status=OK|WARN [alerts="…"]
+#   When PSI stall triggers, "offenders:" and "action:" lines are appended
+#   separately after the per-disk lines.
+#
+#   per-disk fields : in_flight, iops_read/write, util_pct, fs_errors,
+#                     sched, dev
+#   global fields   : load*, iowait_pct, kernel_io_errors, psi_io_*_max
+#   status=MISSING  : configured disk not present in /sys/block (skipped run)
+#
+# Field reference (standard terminology):
+#   in_flight      /proc/diskstats field 12  — I/Os currently in progress
+#                   (queue depth snapshot; >8 sustained = device stalling)
+#   iops_read      reads/s over the interval (iostat "r/s")
+#   iops_write     writes/s over the interval (iostat "w/s")
+#   util_pct       device busy ms / interval — equivalent to iostat "%util"
+#   iowait_pct     CPU time waiting for I/O (vmstat "wa")
+#   psi_io_*_max   peak /proc/pressure/io "some"/"full" avg10 sampled over the
+#                   window — CPU tasks stalled on I/O. full>25 sustained =
+#                   real stall territory.
+#   kernel_io_errors  journalctl -k count of REAL I/O error lines
+#                   ("I/O error", "EXT4-fs error", "medium error", "blk_update").
+#                   NOTE: benign "EXT4-fs (sda2): mounted…" lines do NOT match.
+#   fs_errors      sum of errors_count across the disk's partitions (any
+#                   filesystem exposing /sys/fs/<fstype>/<part>/errors_count,
+#                   e.g. ext4) — filesystem-recorded errors
+#
+# THROTTLE: when psi_io_full_max >= PSI_TRIG, the top I/O consumers over the
+# window (from /proc/<pid>/io deltas) are logged as offN=… and — if
+# MITIGATE>=1 — demoted with `ionice -c3` + `renice 19`. Runs as root, so any
+# user's runaway process can be demoted (never PID 1/kernel threads).
+#   NOTE on sched: ionice is fully honored only by BFQ. If the active elevator
+#   is mq-deadline, ionice is mostly cosmetic; renice still helps the CPU side.
+#
+# ALERT rules (status=WARN, also emitted as a greppable "ALERT:" line):
+#   kernel_io_errors delta > 0        → device/kernel-level I/O failures
+#   fs_errors > 0                     → filesystem recorded errors
+#   in_flight > 8                     → device stalling
+#   util_pct > 80 over the interval   → saturated
+#   psi_io_full_max >= PSI_TRIG       → stall detected, offenders reported
+#
+# First run after a state reset logs status=BASELINE (no deltas, no alerts).
+#
+# Configuration: /etc/disk-watch/disk-watch.conf
+#   (template: examples/disk-watch.conf.example in the project repo)
+#   DISKS="sda"        space-separated list of block devices to watch
+#                      (deprecated alias: DEV=sda)
+#   PSI_TRIG=25        /proc/pressure/io "full avg10" % that counts as a stall
+#   PSI_WINDOW=30      seconds spent sampling PSI per run
+#   PSI_STEP=5         seconds between PSI samples
+#   IO_TRIG_MBPS=5     min MiB/s delta for a process to be reported/throttled
+#   MITIGATE=0|1|2     0 observe only · 1 ionice+renice offenders (default)
+#                      2 additionally SIGSTOP top offender / SIGCONT previous
+#                      (level 2 freezes the process — do NOT use on services!)
+#   COOLDOWN=300       minimum seconds between mitigation actions
+# =============================================================================
+set -u
+CONF="/etc/disk-watch/disk-watch.conf"
+[ -r "$CONF" ] && . "$CONF"
+
+# test/CI seams: directories can be redirected without touching the config
+LOG_DIR=${DISK_WATCH_LOG_DIR:-/var/log/disk-watch}
+LIB_DIR=${DISK_WATCH_LIB_DIR:-/var/lib/disk-watch}
+LOG="$LOG_DIR/disk-watch.log"
+
+# disks to watch: DISKS = space-separated list (DEV kept as deprecated alias)
+DISKS=${DISKS:-${DEV:-sda}}
+
+PSI_TRIG=${PSI_TRIG:-25}
+PSI_WINDOW=${PSI_WINDOW:-30}
+PSI_STEP=${PSI_STEP:-5}
+IO_TRIG_MBPS=${IO_TRIG_MBPS:-5}
+MITIGATE=${MITIGATE:-1}
+COOLDOWN=${COOLDOWN:-300}
+
+# ensure runtime dirs exist (self-healing; installer normally creates them)
+mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
+
+# --- migrate legacy single-disk state (pre-multi-disk releases) ---------------
+first_dev=${DISKS%% *}
+if [ -f "$LIB_DIR/state" ] && [ ! -f "$LIB_DIR/state.$first_dev" ]; then
+  mv "$LIB_DIR/state" "$LIB_DIR/state.$first_dev"
+fi
+
+# --- collect GLOBAL counters ---------------------------------------------------
+now=$(date '+%F %T')
+epoch=$(date +%s)
+load1=$(cut -d' ' -f1 /proc/loadavg); load5=$(cut -d' ' -f2 /proc/loadavg); load15=$(cut -d' ' -f3 /proc/loadavg)
+ioerr=$(journalctl -k --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=${iowait_pct:-0}
+
+# --- I/O per-process snapshot helper -----------------------------------------
+# outputs "pid total_bytes" lines (root can read every process)
+snap_io() {
+  local p pid b
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] && continue
+    [ "$pid" -le 2 ] && continue          # skip PID 1 and kernel threads
+    b=$(awk '/^(read|write)_bytes/{s+=$2} END{print s+0}' "$p/io" 2>/dev/null) || continue
+    [ "${b:-0}" -gt 0 ] && printf '%s %s\n' "$pid" "$b"
+  done
+}
+TMP_A=$(mktemp) ; TMP_B=$(mktemp)
+trap 'rm -f "$TMP_A" "$TMP_B"' EXIT
+snap_io > "$TMP_A"
+
+# --- PSI sampling window ------------------------------------------------------
+psi_max_some=0; psi_max_full=0
+if [ -r /proc/pressure/io ]; then
+  waited=0
+  while :; do
+    s=$(awk '/^some/{v=$2} /^full/{f=$2} END{sub("avg10=","",v); sub("avg10=","",f); printf "%d %d", v+0, f+0}' /proc/pressure/io)
+    s_some=${s% *}; s_full=${s#* }
+    [ "${s_some:-0}" -gt "$psi_max_some" ] && psi_max_some=$s_some
+    [ "${s_full:-0}"  -gt "$psi_max_full" ] && psi_max_full=$s_full
+    [ "$waited" -ge "$PSI_WINDOW" ] && break
+    sleep "$PSI_STEP"; waited=$((waited + PSI_STEP))
+  done
+fi
+snap_io > "$TMP_B"
+
+# --- offender ranking over the window (global, process-level) -----------------
+tops=$(awk 'NR==FNR{a[$1]=$2; next} $1 in a {d=$2-a[$1]; if(d>0) printf "%d %s\n", d, $1}' "$TMP_A" "$TMP_B" \
+       | sort -rn | head -3)
+trig=0
+[ "$psi_max_full" -ge "$PSI_TRIG" ] && trig=1
+
+# --- fs error count for one disk = sum over its partitions --------------------
+fs_err_of() {
+  local dev=$1 total=0 pcnt f
+  for pcnt in $(ls "/sys/block/$dev" 2>/dev/null | grep "^$dev"); do
+    for f in /sys/fs/*/"$pcnt"/errors_count; do
+      [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
+    done
+  done
+  for f in /sys/fs/*/"$dev"/errors_count; do   # whole-device filesystem (rare)
+    [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
+  done
+  echo "$total"
+}
+
+# --- mitigation state ----------------------------------------------------------
+MSTATE="$LIB_DIR/mitigate.state"
+
+# --- PER-DISK pass: emit one line per configured device ------------------------
+any_warn=0
+
+for dev in $DISKS; do
+
+  if [ ! -d "/sys/block/$dev" ]; then
+    line=$(printf '%s dev=%s status=MISSING' "$now" "$dev")
+    echo "$line" >> "$LOG"; echo "$line"
+    any_warn=1
+    continue
+  fi
+
+  eval "$(awk -v d="$dev" '$3==d {printf "rd=%d ws=%d ifl=%d io_ms=%d", $4, $8, $12, $13}' /proc/diskstats)"
+  rd=${rd:-0}; ws=${ws:-0}; ifl=${ifl:-0}; io_ms=${io_ms:-0}
+  fs_err=$(fs_err_of "$dev")
+  sched=$(cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | awk -F'[][]' '{print $2}')
+  sched=${sched:-none}
+
+  sfile="$LIB_DIR/state.$dev"
+  status=OK
+  alerts=""
+  if [ -f "$sfile" ]; then
+    read -r p_epoch p_io p_rd p_wr p_err < "$sfile" 2>/dev/null || true
+    p_epoch=${p_epoch:-0}; p_io=${p_io:-0}; p_rd=${p_rd:-0}; p_wr=${p_wr:-0}; p_err=${p_err:-0}
+    wall_s=$(( epoch - p_epoch )); [ "$wall_s" -lt 1 ] && wall_s=1
+    util_pct=$(( io_ms > p_io ? (io_ms - p_io) * 100 / (wall_s * 1000) : 0 ))
+    [ "$util_pct" -gt 100 ] && util_pct=100
+    d_rd=$(( rd > p_rd ? rd - p_rd : 0 ))
+    d_wr=$(( ws > p_wr ? ws - p_wr : 0 ))
+    iops_r=$(( d_rd / wall_s )); iops_w=$(( d_wr / wall_s ))
+
+    d_err=$(( ioerr > p_err ? ioerr - p_err : 0 ))
+    [ "$d_err" -gt 0 ] && { alerts="${alerts:+$alerts }KERNEL_IO_ERRORS+${d_err}"; status=WARN; }
+    [ "$fs_err" -gt 0 ] && { alerts="${alerts:+$alerts }FS_ERRORS=$fs_err"; status=WARN; }
+    [ "$ifl" -gt 8 ]     && { alerts="${alerts:+$alerts }IN_FLIGHT_HIGH=$ifl";   status=WARN; }
+    [ "$util_pct" -gt 80 ] && { alerts="${alerts:+$alerts }UTIL_HIGH=${util_pct}%"; status=WARN; }
+  else
+    iops_r=0; iops_w=0; util_pct=0   # BASELINE run for this disk
+  fi
+  printf '%s %s %s %s %s\n' "$epoch" "$io_ms" "$rd" "$ws" "$ioerr" > "$sfile"
+  if [ "$trig" -eq 1 ]; then
+    alerts="${alerts:+$alerts }PSI_HIGH=${psi_max_full}%"; status=WARN
+  fi
+  [ "$status" = "WARN" ] && any_warn=1
+
+  line=$(printf '%s dev=%s load_1m=%s load_5m=%s load_15m=%s in_flight=%d iops_read=%s iops_write=%s busy_ms_delta=%dms util_pct=%d iowait_pct=%s kernel_io_errors=%d fs_errors=%d psi_io_some_max=%d psi_io_full_max=%d sched=%s status=%s' \
+    "$now" "$dev" "$load1" "$load5" "$load15" "$ifl" "$iops_r" "$iops_w" 0 "$util_pct" "$iowait_pct" "$ioerr" "$fs_err" "$psi_max_some" "$psi_max_full" "$sched" "$status")
+  [ -n "$alerts" ] && line="$line alerts=\"$alerts\""
+  echo "$line" >> "$LOG"
+  echo "$line"
+done
+
+# --- offender reporting + reactive mitigation (global, process-level) ---------
+off_list=""; act=""
+if [ "$trig" -eq 1 ]; then
+  min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 ))
+  reported=0
+  while read -r d pid; do
+    [ -r "/proc/$pid/comm" ] || continue
+    [ "$d" -lt "$min_bytes" ] && continue
+    mb=$(( d / (1024 * 1024) ))
+    comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -d ' ')
+    off_list="${off_list:+$off_list }off$((reported+1))=${pid}:${comm_name}:${mb}MBps"
+    reported=$((reported + 1))
+  done <<EOF
+$tops
+EOF
+fi
+
+if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
+  last=0; stopped_pid=""
+  [ -f "$MSTATE" ] && read -r last stopped_pid < "$MSTATE" 2>/dev/null || true
+  acted=0; acted_pids=""
+  if [ $(( epoch - last )) -ge "$COOLDOWN" ]; then
+    if [ "$MITIGATE" -ge 2 ] && [ -n "$stopped_pid" ] && [ "$stopped_pid" != "0" ]; then
+      kill -CONT "$stopped_pid" 2>/dev/null && act="SIGCONT:$stopped_pid"
+    fi
+    while read -r d pid; do
+      [ -r "/proc/$pid/comm" ] || continue
+      [ "$d" -lt "$min_bytes" ] && continue
+      [ "$pid" -le 2 ] && continue
+      if [ "$MITIGATE" -ge 1 ]; then
+        ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
+          && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
+      fi
+      if [ "$MITIGATE" -ge 2 ]; then
+        kill -STOP "$pid" 2>/dev/null && stopped_pid=$pid
+        break   # pendulum: keep at most one process frozen between runs
+      fi
+    done <<EOF
+$tops
+EOF
+    if [ "$acted" -eq 1 ]; then
+      act="${act:+$act }ionice+renice pids=$acted_pids"
+      act="$act (ionice fully binding only under bfq)"
+    fi
+    printf '%s %s\n' "$epoch" "${stopped_pid:-0}" > "$MSTATE"
+  else
+    act="cooldown $(( COOLDOWN - (epoch - last) ))s"
+  fi
+elif [ "$MITIGATE" -ge 2 ] && [ -f "$MSTATE" ]; then
+  read -r last stopped_pid < "$MSTATE" 2>/dev/null || true
+  if [ -n "${stopped_pid:-}" ] && [ "$stopped_pid" != "0" ]; then
+    kill -CONT "$stopped_pid" 2>/dev/null && printf '%s 0\n' "$epoch" > "$MSTATE"
+  fi
+fi
+
+# --- append offender/action fields to this run's log lines --------------------
+if [ -n "$off_list" ] || [ -n "$act" ]; then
+  [ -n "$off_list" ] && { echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; }
+  [ -n "$act" ]      && { echo "action: $act" >> "$LOG"; echo "action: $act"; }
+fi
+
+[ "$any_warn" -eq 1 ] && echo "ALERT: see status=WARN lines above"
+exit 0

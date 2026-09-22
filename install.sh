@@ -7,13 +7,10 @@
 #   2. creates /etc/disk-watch, /var/lib/disk-watch, /var/log/disk-watch
 #   3. installs the central config /etc/disk-watch/disk-watch.conf
 #      (never overwrites an existing config — only sets the DISKS= line)
-#   4. INTERACTIVELY asks which disks to watch (or accepts --disks "sda sdb",
+#   4. interactively asks which disks to watch (or accepts --disks "sda sdb",
 #      or falls back to the root disk when non-interactive)
 #   5. installs systemd units (system-wide, user-independent) and enables
 #      the 5-minute timer
-#   6. migrates data from a previous per-user installation (log + state) and
-#      REMOVES the old per-user setup (user timer/service units + user config)
-#      for the invoking user (sudo "$SUDO_USER")
 #
 # Usage:
 #   sudo ./install.sh                       # interactive disk prompt
@@ -47,13 +44,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------- steps 1-3
-echo "==> [1/6] installing binary to $BIN_DST"
+echo "==> [1/5] installing binary to $BIN_DST"
 install -m 0755 "$SRC_DIR/disk-watch" "$BIN_DST"
 
-echo "==> [2/6] creating runtime directories"
+echo "==> [2/5] creating runtime directories"
 install -d -m 0755 "$CONF_DIR" "$LIB_DIR" "$LOG_DIR"
 
-echo "==> [3/6] installing central config to $CONF_DST"
+echo "==> [3/5] installing central config to $CONF_DST"
 if [[ -f $CONF_DST ]]; then
   echo "    already exists — keeping current config (DISKS line will be updated)"
 else
@@ -74,7 +71,7 @@ root_disk=$(lsblk -no pkname "${root_src#/dev/}" 2>/dev/null || true)
 def_conf=$(grep -hE '^(DISKS|DEV)=' "$CONF_DST" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || true)
 DEFAULT_DISKS=${def_conf:-$root_disk}
 
-echo "==> [4/6] selecting disks to watch"
+echo "==> [4/5] selecting disks to watch"
 echo "    available disks:"
 i=0
 for c in "${CAND[@]}"; do
@@ -137,67 +134,32 @@ sed -i '/^DISKS=/d; /^DEV=/d' "$CONF_DST"
 printf 'DISKS="%s"\n' "$SELECTED" >> "$CONF_DST"
 
 # ---------------------------------------------------------------- step 5
-echo "==> [5/6] installing systemd units (system-wide)"
+echo "==> [5/5] installing systemd units and enabling the timer"
 install -m 0644 "$SRC_DIR/systemd/disk-watch.service" "$UNIT_DIR/disk-watch.service"
 install -m 0644 "$SRC_DIR/systemd/disk-watch.timer"   "$UNIT_DIR/disk-watch.timer"
-
-# ---------------------------------------------------------------- step 6
-echo "==> [6/6] migrating data from previous per-user installation (if any)"
-if [[ -n "${SUDO_USER:-}" ]] && getent passwd "$SUDO_USER" >/dev/null; then
-  UHOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-  UUID=$(id -u "$SUDO_USER")
-
-  # migrate history: old log + delta states (only if new locations are empty)
-  if [[ -f "$UHOME/disk-health.log" && ! -e "$LOG_DIR/disk-watch.log" ]]; then
-    install -m 0640 "$UHOME/disk-health.log" "$LOG_DIR/disk-watch.log"
-    echo "    migrated health log: $UHOME/disk-health.log -> $LOG_DIR/disk-watch.log"
-  fi
-  for old_state in "$UHOME"/.disk-watch.state "$LIB_DIR"/state; do
-    :
-  done
-  if [[ -f "$UHOME/.disk-watch.state" ]]; then
-    # the script itself renames plain "state" -> "state.<first-disk>" on first run
-    if [[ ! -e "$LIB_DIR/state" ]]; then
-      install -m 0644 "$UHOME/.disk-watch.state" "$LIB_DIR/state"
-      echo "    migrated delta state: $UHOME/.disk-watch.state -> $LIB_DIR/state"
-    fi
-  fi
-
-  # stop + disable + remove the old per-user timer/service
-  if [[ -d "/run/user/$UUID" ]]; then
-    runuser -u "$SUDO_USER" -- env XDG_RUNTIME_DIR="/run/user/$UUID" \
-      systemctl --user stop disk-watch.timer disk-watch.service 2>/dev/null || true
-    runuser -u "$SUDO_USER" -- env XDG_RUNTIME_DIR="/run/user/$UUID" \
-      systemctl --user disable disk-watch.timer 2>/dev/null || true
-  fi
-  removed=0
-  for f in disk-watch.timer disk-watch.service; do
-    if [[ -f "$UHOME/.config/systemd/user/$f" ]]; then
-      rm -f "$UHOME/.config/systemd/user/$f"
-      removed=1
-    fi
-  done
-  if [[ $removed -eq 1 && -d "/run/user/$UUID" ]]; then
-    runuser -u "$SUDO_USER" -- env XDG_RUNTIME_DIR="/run/user/$UUID" \
-      systemctl --user daemon-reload 2>/dev/null || true
-  fi
-  [[ $removed -eq 1 ]] && echo "    removed per-user units for $SUDO_USER"
-
-  # remove the old per-user config (central config replaces it)
-  if [[ -f "$UHOME/.config/disk-watch.conf" ]]; then
-    rm -f "$UHOME/.config/disk-watch.conf"
-    echo "    removed per-user config: $UHOME/.config/disk-watch.conf"
-  fi
-
-  # NOTE: the old copy at $UHOME/bin/disk-watch is intentionally kept;
-  # it is no longer used by anything. Delete it manually if you wish.
-else
-  echo "    no invoking user detected (SUDO_USER empty) — skipping migration"
-fi
-
-echo "==> enabling systemd timer"
 systemctl daemon-reload
 systemctl enable --now disk-watch.timer
+
+# resolve the next elapse via the systemd bus (raw microseconds):
+#   On*Sec (monotonic) timers -> NextElapseUSecMonotonic (µs since boot)
+#   OnCalendar (realtime) ones -> NextElapseUSecRealtime (µs since epoch)
+# Right after a trigger both can be transiently unset — hence the fallback.
+next_run() {
+  local unit=disk-watch.timer
+  local path="/org/freedesktop/systemd1/unit/${unit//./_2e}"
+  path=${path//-/_2d}
+  local mono rt up_us
+  mono=$(busctl get-property org.freedesktop.systemd1 "$path" org.freedesktop.systemd1.Timer NextElapseUSecMonotonic 2>/dev/null | awk '{print $2}')
+  if [[ $mono =~ ^[0-9]+$ && $mono -gt 0 ]]; then
+    up_us=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+    date -d "@$(( $(date +%s) + (mono - up_us) / 1000000 ))" '+%F %T %Z' && return 0
+  fi
+  rt=$(busctl get-property org.freedesktop.systemd1 "$path" org.freedesktop.systemd1.Timer NextElapseUSecRealtime 2>/dev/null | awk '{print $2}')
+  if [[ $rt =~ ^[0-9]+$ && $rt -gt 0 ]]; then
+    date -d "@$(( rt / 1000000 ))" '+%F %T %Z' && return 0
+  fi
+  echo "scheduling in progress — check: systemctl list-timers $unit"
+}
 
 echo
 echo "Done. disk-watch is installed system-wide."
@@ -207,4 +169,4 @@ echo "  log    : $LOG_DIR/disk-watch.log"
 echo "  state  : $LIB_DIR/"
 echo "  timer  : $(systemctl is-enabled disk-watch.timer 2>/dev/null) ($(systemctl is-active disk-watch.timer 2>/dev/null))"
 echo
-echo "Next run: $(systemctl show disk-watch.timer -p NextElapseUSecRealtime --value)"
+echo "Next run: $(next_run)"

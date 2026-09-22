@@ -42,10 +42,6 @@ sudo ./install.sh
 - log     → `/var/log/disk-watch/disk-watch.log`
 - units   → `/etc/systemd/system/disk-watch.{service,timer}`, timer enabled
 
-If run via `sudo` by a user who previously had the per-user version, the installer
-migrates the old log + delta state and **removes the old per-user units and config**
-so exactly one scheduler exists.
-
 ## Configuration
 
 Edit `/etc/disk-watch/disk-watch.conf` (see `examples/` for the annotated template):

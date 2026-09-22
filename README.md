@@ -53,6 +53,34 @@ Every 5 minutes the timer fires and `beniced` does this:
 Everything is one `key=value` line per disk in a plain log file. No
 dashboard required.
 
+## Prerequisites
+
+The big one: **PSI (Pressure Stall Information) must be present and enabled.**
+beniced reads `/proc/pressure/io`; without it stall detection has nothing to
+measure. Most mainline distro kernels ship this on by default — but Raspberry
+Pi OS builds it disabled (`CONFIG_PSI_DEFAULT_DISABLED=y`), so on a Pi you
+need one extra step:
+
+```bash
+# append psi=1 to the kernel command line (cmdline.txt is a SINGLE line —
+# append to it, do not create a second line)
+sudo sed -i 's/$/ psi=1/' /boot/firmware/cmdline.txt
+sudo reboot
+
+# verify after the reboot:
+cat /proc/pressure/io        # should print some/full statistics
+```
+
+If `/proc/pressure/io` is missing, beniced still logs disk health, but runs
+are marked `MISSING_PSI` and stall detection stays inactive.
+
+The rest is modest:
+
+- systemd (a oneshot service + a timer, no extras)
+- bash and the usual coreutils (`awk`, `vmstat`, `ionice`, `renice`,
+  `journalctl`)
+- root — beniced must be able to see and throttle every user's processes
+
 ## Installation
 
 ```bash
@@ -126,8 +154,8 @@ sudo ./uninstall.sh --purge   # also removes config, logs and state
   flagged.
 - `beniced` runs as root, because it needs to see and throttle every user's
   processes. It refuses to touch PID 1 and kernel threads.
-- Requires: Linux with PSI support (kernel 4.20+, enabled by default on most
-  modern distros), systemd, bash, and the usual coreutils. Nothing else.
+- Requirements are listed in [Prerequisites](#prerequisites) — the big one is
+  PSI being present and enabled.
 
 ## License
 

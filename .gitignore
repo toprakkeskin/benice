@@ -1,3 +1,4 @@
 # runtime artifacts (never commit)
 *.log
 *.state
+.pi/

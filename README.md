@@ -46,9 +46,12 @@ Every 5 minutes the timer fires and `beniced` does this:
 3. Snapshots per-process I/O (`/proc/<pid>/io`) before and after that window
    and diffs them. Whatever ate the most bytes is your suspect.
 4. If the pressure crossed the threshold, the top consumers are written to the
-   log (`off1=4242:chromium:87MBps`) and — if mitigation is on — demoted with
-   `ionice -c3` and `renice 19`. The offenders keep running. They just lose
-   every queue they are standing in.
+   log (`off1=4242:chromium:87MiB` — bytes accumulated over the window, not a
+   rate) and — if mitigation is on — demoted with `ionice -c3` and `renice 19`.
+   The offenders keep running. They just lose every queue they are standing
+   in, temporarily: their original nice is recorded before the demotion, and
+   once the disk has stayed calm for two consecutive runs the nice is given
+   back (logged as `restored:` lines).
 
 Everything is one `key=value` line per disk in a plain log file. No
 dashboard required.
@@ -88,8 +91,9 @@ sudo ./install.sh
 ```
 
 The installer asks which disks you want to watch (it lists them, and marks
-the root disk), installs a systemd unit and a 5-minute timer, and enables
-them. For unattended setups:
+the root disk), installs a systemd unit and a 5-minute timer, drops a
+logrotate stanza for the log, warns you if PSI looks unavailable on this
+kernel, and enables everything. For unattended setups:
 
 ```bash
 sudo ./install.sh --disks "sda"
@@ -105,8 +109,9 @@ touches your existing config.
 | `/usr/local/sbin/beniced` | the sampler itself |
 | `/etc/benice/benice.conf` | central configuration (survives upgrades) |
 | `/var/log/benice/benice.log` | one `key=value` line per disk, per run |
+| `/etc/logrotate.d/benice` | keeps the log from growing forever |
 | `/var/lib/benice/state.<dev>` | per-disk counters between runs, for deltas |
-| `/var/lib/benice/mitigate.state` | throttle bookkeeping (cooldowns, frozen pid) |
+| `/var/lib/benice/mitigate.state` | throttle bookkeeping (cooldowns, frozen pid, demoted pids + original nice) |
 | `/etc/systemd/system/beniced.service` | oneshot unit, runs as root |
 | `/etc/systemd/system/beniced.timer` | fires it every 5 minutes |
 
@@ -120,8 +125,8 @@ sourced fresh every time, no restart needed.
 | `DISKS` | `sda` | space-separated list of devices to watch |
 | `PSI_TRIG` | `25` | PSI "full" avg10 % above which a stall is declared |
 | `PSI_WINDOW` / `PSI_STEP` | `30` / `5` | PSI sampling window and step (seconds) |
-| `IO_TRIG_MBPS` | `5` | minimum MiB/s for a process to be flagged |
-| `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze/unfreeze |
+| `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
+| `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 | `COOLDOWN` | `300` | minimum seconds between two mitigations |
 
 ## Reading the log
@@ -134,8 +139,22 @@ sourced fresh every time, no restart needed.
 
 Most of it is standard iostat vocabulary. The interesting bits: `util_pct` is
 how much of the interval the disk was busy; `psi_io_full_max` is the peak
-percentage of time tasks were *blocked* on I/O — if that climbs while
-`status=WARN` appears with an `off1=...` field, the log names the culprit.
+percentage of time tasks were *blocked* on I/O — if that climbs and
+`status=WARN` appears, the run names the culprit.
+
+When the pressure threshold trips, the offending runs get their own lines:
+
+```text
+offenders: off1=4242:chromium:87MiB off2=891:backup:12MiB
+action: ionice+renice pids=4242 (ionice fully binding only under bfq)
+restored: pid=4242 nice=0
+```
+
+`offN=` names the culprit together with the MiB it moved during the window
+(not a rate). `action:` records what beniced did about it, and `restored:`
+appears when a previously demoted process has been given its original nice
+back — that happens automatically after two consecutive runs with no PSI
+trigger.
 
 ## Uninstall
 
@@ -149,9 +168,16 @@ sudo ./uninstall.sh --purge   # also removes config, logs and state
 - `ionice` is only fully honored by the BFQ scheduler. On other elevators
   (mq-deadline is common) it is mostly cosmetic; `renice` always works on the
   CPU side.
-- `MITIGATE=2` freezes the top offender between runs (SIGSTOP, then SIGCONT).
-  It works, but do not enable it if a database or server could ever be
+- `MITIGATE=2` freezes the top offender until the next run. Crash-safe: the
+  pid (plus its `/proc` start time and original nice) is written to the state
+  file *before* the SIGSTOP, and every run starts by SIGCONT-ing whatever is
+  on record — even a power cut mid-freeze cannot leave a process stopped
+  forever. Still, do not enable it if a database or server could ever be
   flagged.
+- Demotion is not a life sentence. Every offender's original nice is recorded
+  at demote time, and after two consecutive runs with no PSI trigger the
+  surviving offenders are reniced back automatically (`restored:` lines in
+  the log). Processes that exited in the meantime are simply dropped.
 - `beniced` runs as root, because it needs to see and throttle every user's
   processes. It refuses to touch PID 1 and kernel threads.
 - Requirements are listed in [Prerequisites](#prerequisites) — the big one is

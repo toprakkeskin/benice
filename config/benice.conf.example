@@ -12,13 +12,20 @@
 #PSI_WINDOW=30
 #PSI_STEP=5
 
-# Minimum MiB/s delta for a process to be reported/throttled as an offender
+# Minimum MiB a process must transfer during the PSI window (the value times
+# the window length) to be reported/throttled as an offender — the log label
+# reports MiB per window, not MiB/s
 #IO_TRIG_MBPS=5
 
 # Mitigation level:
 #   0 = observe only (log offenders, take no action)
-#   1 = demote offenders: ionice -c3 + renice 19  (default, safe)
-#   2 = additionally SIGSTOP the top offender and SIGCONT it on the next run.
+#   1 = demote offenders: ionice -c3 + renice 19  (default, safe).
+#       The original nice is recorded first; after 2 consecutive clean runs
+#       (no PSI trigger) surviving offenders are restored to it.
+#   2 = additionally SIGSTOP the top offender; the next run unfreezes it.
+#       Orphan-safe: the pid, its /proc start time and original nice are
+#       written to the state file BEFORE the STOP, and the next run SIGCONTs
+#       any recorded pid unconditionally.
 #       WARNING: freezes the process — never enable for services that must
 #       stay responsive (databases, servers, …)
 #MITIGATE=1

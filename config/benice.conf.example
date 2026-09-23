@@ -29,6 +29,3 @@
 #       WARNING: freezes the process — never enable for services that must
 #       stay responsive (databases, servers, …)
 #MITIGATE=1
-
-# Minimum seconds between two mitigation actions
-#COOLDOWN=300

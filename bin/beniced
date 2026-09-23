@@ -108,7 +108,6 @@
 #                    old 5-field files (no uptime_s) are read via the epoch
 #                    fallback and upgraded on the next write.
 #   mitigate.state   key=value lines (one per line), written every run:
-#                      last=<epoch>               last mitigation pass (cooldown)
 #                      stopped_pid=<pid>          pid frozen by MITIGATE=2 (0=none)
 #                      stopped_start=<starttime>  its /proc/<pid>/stat starttime
 #                      hint_bfq=1                 non-BFQ hint already emitted
@@ -139,7 +138,6 @@
 #                      2 additionally SIGSTOP the top offender until the end
 #                      of the run (orphan-safe pendulum — see above; do NOT
 #                      use on services that must stay responsive!)
-#   COOLDOWN=300       minimum seconds between mitigation actions
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -158,7 +156,6 @@ PSI_WINDOW=${PSI_WINDOW:-30}
 PSI_STEP=${PSI_STEP:-5}
 IO_TRIG_MBPS=${IO_TRIG_MBPS:-5}
 MITIGATE=${MITIGATE:-1}
-COOLDOWN=${COOLDOWN:-300}
 
 # F11: clamp PSI_TRIG to >= 1 so the "0 >= 0" always-true seam is gone
 case $PSI_TRIG in ''|*[!0-9]*) PSI_TRIG=25 ;; esac
@@ -259,11 +256,10 @@ restore_ionice() {   # pid nice iclass iprio -> sets r_label + r_kdef
 
 # --- mitigation state (format documented in the header) -----------------------
 MSTATE="$LIB_DIR/mitigate.state"
-m_last=0; m_stopped_pid=0; m_stopped_start=0; m_hint_bfq=0; m_demoted=""
+m_stopped_pid=0; m_stopped_start=0; m_hint_bfq=0; m_demoted=""
 if [ -f "$MSTATE" ]; then
   while IFS= read -r mline; do
     case $mline in
-      last=*)          num_ok "${mline#last=}"          && m_last=${mline#last=} ;;
       stopped_pid=*)   num_ok "${mline#stopped_pid=}"   && m_stopped_pid=${mline#stopped_pid=} ;;
       stopped_start=*) num_ok "${mline#stopped_start=}" && m_stopped_start=${mline#stopped_start=} ;;
       hint_bfq=*)      num_ok "${mline#hint_bfq=}"      && m_hint_bfq=${mline#hint_bfq=} ;;
@@ -272,8 +268,8 @@ if [ -f "$MSTATE" ]; then
   done < "$MSTATE"
 fi
 mstate_write() {
-  printf 'last=%s\nstopped_pid=%s\nstopped_start=%s\nhint_bfq=%s\ndemoted=%s\n' \
-    "$m_last" "$m_stopped_pid" "${m_stopped_start:-0}" "$m_hint_bfq" "$m_demoted" \
+  printf 'stopped_pid=%s\nstopped_start=%s\nhint_bfq=%s\ndemoted=%s\n' \
+    "$m_stopped_pid" "${m_stopped_start:-0}" "$m_hint_bfq" "$m_demoted" \
     > "$MSTATE" 2>/dev/null || true
 }
 demoted_has() {      # pid starttime -> true if already on the demoted list
@@ -525,60 +521,56 @@ m_demoted=$keep
 # --- reactive mitigation: demote THIS run's new offenders ---------------------
 if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
   acted=0; acted_pids=""
-  if [ $(( epoch - m_last )) -ge "$COOLDOWN" ]; then
-    while read -r d pentry; do
-      pid=${pentry%%:*}; pstart=${pentry##*:}
-      [ "$pid" -le 2 ] && continue
-      [ "$d" -lt "$min_bytes" ] && continue
-      proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
-      [ -r "/proc/$pid/comm" ] || continue
-      if [ "$MITIGATE" -ge 1 ]; then
-        # F6/I1: remember the original nice AND I/O class+level once, so the
-        # demotion can be undone exactly; the entry starts its per-entry
-        # clean counter at 0 (I2)
-        if ! demoted_has "$pid" "$pstart"; then
-          onice=$(proc_nice "$pid"); num_ok "$onice" || onice=0
-          iop=$(ionice_get "$pid"); iop=${iop:-"2 4"}
-          o_iclass=${iop%% *}; o_iprio=${iop##* }
-          case $o_iclass in ''|*[!0-9]*) o_iclass=2 ;; esac
-          case $o_iprio  in ''|*[!0-9]*) o_iprio=4 ;;  esac
-          m_demoted="${m_demoted:+$m_demoted }$pid:$pstart:$onice:$o_iclass:$o_iprio:0"
-        fi
-        ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
-          && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
+  while read -r d pentry; do
+    pid=${pentry%%:*}; pstart=${pentry##*:}
+    [ "$pid" -le 2 ] && continue
+    [ "$d" -lt "$min_bytes" ] && continue
+    proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
+    [ -r "/proc/$pid/comm" ] || continue
+    if [ "$MITIGATE" -ge 1 ]; then
+      # F6/I1: remember the original nice AND I/O class+level once, so the
+      # demotion can be undone exactly; the entry starts its per-entry
+      # clean counter at 0 (I2)
+      if ! demoted_has "$pid" "$pstart"; then
+        onice=$(proc_nice "$pid"); num_ok "$onice" || onice=0
+        iop=$(ionice_get "$pid"); iop=${iop:-"2 4"}
+        o_iclass=${iop%% *}; o_iprio=${iop##* }
+        case $o_iclass in ''|*[!0-9]*) o_iclass=2 ;; esac
+        case $o_iprio  in ''|*[!0-9]*) o_iprio=4 ;;  esac
+        m_demoted="${m_demoted:+$m_demoted }$pid:$pstart:$onice:$o_iclass:$o_iprio:0"
       fi
-      if [ "$MITIGATE" -ge 2 ]; then
-        stopped_pid=$pid; stopped_start=$pstart
-        m_stopped_pid=$pid; m_stopped_start=$pstart
-        mstate_write                             # F7: record BEFORE the STOP
-        kill -STOP "$pid" 2>/dev/null || {
-          stopped_pid=0; stopped_start=0; m_stopped_pid=0; m_stopped_start=0
-          mstate_write                       # revert the pre-STOP record
-        }
-        break   # pendulum: at most one process frozen per run
-      fi
-    done <<EOF
+      ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
+        && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
+    fi
+    if [ "$MITIGATE" -ge 2 ]; then
+      stopped_pid=$pid; stopped_start=$pstart
+      m_stopped_pid=$pid; m_stopped_start=$pstart
+      mstate_write                             # F7: record BEFORE the STOP
+      kill -STOP "$pid" 2>/dev/null || {
+        stopped_pid=0; stopped_start=0; m_stopped_pid=0; m_stopped_start=0
+        mstate_write                       # revert the pre-STOP record
+      }
+      break   # pendulum: at most one process frozen per run
+    fi
+  done <<EOF
 $tops
 EOF
-    if [ "$acted" -eq 1 ]; then
-      act="${act:+$act }ionice+renice pids=$acted_pids"
-      # I3: one-time non-BFQ hint — once per mitigate.state lifetime
-      if [ "$m_hint_bfq" != "1" ]; then
-        h_sched=""
-        for hdev in $DISKS; do
-          hs=$(cat "/sys/block/$hdev/queue/scheduler" 2>/dev/null | awk -F'[][]' '{print $2}')
-          if [ -n "$hs" ]; then h_sched=$hs; break; fi
-        done
-        if [ -n "$h_sched" ] && [ "$h_sched" != "bfq" ]; then
-          hint_line="hint: scheduler is $h_sched — ionice demotion is fully binding only under bfq"
-          m_hint_bfq=1
-        fi
+  if [ "$acted" -eq 1 ]; then
+    act="${act:+$act }ionice+renice pids=$acted_pids"
+    # I3: one-time non-BFQ hint — once per mitigate.state lifetime
+    if [ "$m_hint_bfq" != "1" ]; then
+      h_sched=""
+      for hdev in $DISKS; do
+        hs=$(cat "/sys/block/$hdev/queue/scheduler" 2>/dev/null | awk -F'[][]' '{print $2}')
+        if [ -n "$hs" ]; then h_sched=$hs; break; fi
+      done
+      if [ -n "$h_sched" ] && [ "$h_sched" != "bfq" ]; then
+        hint_line="hint: scheduler is $h_sched — ionice demotion is fully binding only under bfq"
+        m_hint_bfq=1
       fi
     fi
-    m_last=$epoch
-  else
-    act="cooldown $(( COOLDOWN - (epoch - m_last) ))s"
   fi
+
 fi
 
 # --- append offender/action/hint/restored lines to this run's log --------------

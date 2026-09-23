@@ -1,31 +1,32 @@
 # /etc/benice/benice.conf — BeNice configuration
-# Sourced by beniced on every run. All values below are the defaults;
-# uncomment a line to override.
+#
+# Sourced by beniced (the sampler) on every run. Every parameter is listed
+# with its default value — edit a value and it applies on the next run.
+# Missing lines fall back to the built-in defaults shown here.
 
-# Block devices to watch (space-separated list)
-#DISKS="sda"
+# Disks to watch (space-separated list of block devices)
+DISKS="sda"
 
-# /proc/pressure/io "full avg10" percentage above which a stall is declared
-#PSI_TRIG=25
+# PSI "full" avg10 percentage above which a stall is declared
+PSI_TRIG=25
 
-# PSI sampling window (seconds) and step between samples
-#PSI_WINDOW=30
-#PSI_STEP=5
+# PSI sampling window and step, in seconds
+PSI_WINDOW=30
+PSI_STEP=5
 
-# Minimum MiB a process must transfer during the PSI window (the value times
-# the window length) to be reported/throttled as an offender — the log label
-# reports MiB per window, not MiB/s
-#IO_TRIG_MBPS=5
+# Minimum MiB a process must transfer during the PSI window to be
+# reported/throttled as an offender (the log reports MiB per window)
+IO_TRIG_MBPS=5
 
 # Mitigation level:
 #   0 = observe only (log offenders, take no action)
-#   1 = demote offenders: ionice -c3 + renice 19  (default, safe).
-#       The original nice is recorded first; after 2 consecutive clean runs
-#       (no PSI trigger) surviving offenders are restored to it.
+#   1 = demote offenders: ionice -c3 + renice 19  (default). The original
+#       nice and ionice are recorded first; after 2 consecutive clean runs
+#       (no PSI trigger) surviving offenders are restored to them.
 #   2 = additionally SIGSTOP the top offender; the next run unfreezes it.
-#       Orphan-safe: the pid, its /proc start time and original nice are
-#       written to the state file BEFORE the STOP, and the next run SIGCONTs
-#       any recorded pid unconditionally.
+#       Orphan-safe: the pid, its /proc start time and the original nice
+#       and ionice are written to the state file BEFORE the STOP, and the
+#       next run SIGCONTs any recorded pid unconditionally.
 #       WARNING: freezes the process — never enable for services that must
 #       stay responsive (databases, servers, …)
-#MITIGATE=1
+MITIGATE=1

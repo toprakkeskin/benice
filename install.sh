@@ -82,7 +82,7 @@ if [[ -f $CONF_DST ]]; then
   echo "    already exists — keeping current config (DISKS line will be updated)"
 else
   install -m 0644 "$SRC_DIR/config/benice.conf.example" "$CONF_DST"
-  echo "    installed default template (all knobs commented out)"
+  echo "    installed template with the default values"
 fi
 
 # ---------------------------------------------------------------- PSI check

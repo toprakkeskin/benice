@@ -1,32 +1,58 @@
 # /etc/benice/benice.conf — BeNice configuration
 #
-# Sourced by beniced (the sampler) on every run. Every parameter is listed
-# with its default value — edit a value and it applies on the next run.
-# Missing lines fall back to the built-in defaults shown here.
+# Sourced by beniced on every run. Every parameter is listed with its
+# default value — edit a value and it applies on the next run. Missing
+# lines fall back to the built-in defaults shown here.
+#
+# The one-sentence version: every 5 minutes beniced samples how badly the
+# watched disks are stalling; when tasks are blocked on I/O above a
+# threshold, the processes that moved the most data get their I/O and CPU
+# priority lowered until the pressure has stayed away for a while.
 
-# Disks to watch (space-separated list of block devices)
+# Disks to watch, space-separated (one health line per disk per run)
 DISKS="sda"
 
-# PSI "full" avg10 percentage above which a stall is declared
+# ---- when to call it a stall (PSI, /proc/pressure/io) -----------------------
+# PSI "full" measures the share of time tasks spent BLOCKED because the disk
+# could not keep up. beniced always reads the avg10 column — the kernel's own
+# rolling average over the last 10 seconds, as a percentage. PSI_STEP does
+# not change that: it only decides how often avg10 is re-read during the
+# window, and the highest reading is what counts. Example: full avg10=25
+# means "in the worst 10s of the window, tasks were completely blocked a
+# quarter of the time". PSI_TRIG is the value a run must reach to declare
+# a stall and look for offenders.
+
 PSI_TRIG=25
 
-# PSI sampling window and step, in seconds
+# ---- how carefully to look --------------------------------------------------
+# beniced samples PSI every PSI_STEP seconds for PSI_WINDOW seconds in
+# total and keeps the highest values it saw. Longer windows catch bursts
+# that a single glance would miss (each run takes PSI_WINDOW + ~2s).
+
 PSI_WINDOW=30
 PSI_STEP=5
 
-# Minimum MiB a process must transfer during the PSI window to be
-# reported/throttled as an offender (the log reports MiB per window)
+# ---- who is to blame --------------------------------------------------------
+# During a declared stall, a process is reported (and demoted, see
+# MITIGATE) when it moved at least IO_TRIG_MBPS MiB through the watched
+# disk during the window. The log reports the amount as MiB per window.
+
 IO_TRIG_MBPS=5
 
-# Mitigation level:
-#   0 = observe only (log offenders, take no action)
-#   1 = demote offenders: ionice -c3 + renice 19  (default). The original
-#       nice and ionice are recorded first; after 2 consecutive clean runs
-#       (no PSI trigger) surviving offenders are restored to them.
-#   2 = additionally SIGSTOP the top offender; the next run unfreezes it.
-#       Orphan-safe: the pid, its /proc start time and the original nice
-#       and ionice are written to the state file BEFORE the STOP, and the
-#       next run SIGCONTs any recorded pid unconditionally.
-#       WARNING: freezes the process — never enable for services that must
-#       stay responsive (databases, servers, …)
+# ---- how hard to respond ----------------------------------------------------
+# MITIGATE controls what happens to reported offenders:
+#   0 = observe only — offenders are logged, nothing is changed
+#   1 = demote: ionice -c3 (idle I/O class) + renice 19 (lowest CPU
+#       priority) until the pressure has stayed away for a while.
+#       The original nice and the original ionice class/level are recorded
+#       before demoting; after 2 consecutive clean runs (no PSI trigger)
+#       the surviving offenders are restored to exactly those values.
+#   2 = additionally SIGSTOP the top offender for one run (the next run
+#       unfreezes it). Orphan-safe: the pid, its /proc start time, the
+#       original nice and the original ionice are written to the state
+#       file BEFORE the STOP, and every run SIGCONTs any recorded pid
+#       unconditionally — even a crash cannot leave a process frozen
+#       forever.
+#       WARNING: a frozen process may hold locks (databases, …) — never
+#       enable on a machine where a stalled process must stay responsive.
 MITIGATE=1

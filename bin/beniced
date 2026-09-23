@@ -388,8 +388,8 @@ for dev in $DISKS; do
     [ "$psi_ok" -eq 0 ] && miss_alerts="MISSING_DEV MISSING_PSI"
     line=$(printf '%s dev=%s status=MISSING alerts="%s"' "$now" "$dev" "$miss_alerts")
     echo "$line" >> "$LOG"; echo "$line"
-    echo "ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\"" >> "$LOG"
-    echo "ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\""
+    echo "$now ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\"" >> "$LOG"
+    echo "$now ALERT: dev=$dev status=MISSING alerts=\"$miss_alerts\""
     continue
   fi
 
@@ -484,7 +484,7 @@ m_demoted_new=""
 for entry in ${m_demoted:-}; do
   demoted_parse "$entry"
   if ! proc_alive "$d_pid" "$d_start"; then
-    restored_lines+=("restored: pid=$d_pid nice=$d_nice (process had already exited or been killed — nothing to renice)")
+    restored_lines+=("$now restored: pid=$d_pid nice=$d_nice (process had already exited or been killed — nothing to renice)")
     continue                                    # exited — logged, then dropped
   fi
   case " $tops_keys " in
@@ -505,12 +505,12 @@ for entry in ${m_demoted:-}; do
     if renice -n "$d_nice" -p "$d_pid" >/dev/null 2>&1 \
        && restore_ionice "$d_pid" "$d_nice" "$d_iclass" "$d_iprio"; then
       if [ "$r_kdef" -eq 1 ]; then
-        restored_lines+=("restored: pid=$d_pid nice=$d_nice ionice=$r_label (kernel default)")
+        restored_lines+=("$now restored: pid=$d_pid nice=$d_nice ionice=$r_label (kernel default)")
       else
-        restored_lines+=("restored: pid=$d_pid nice=$d_nice ionice=$r_label")
+        restored_lines+=("$now restored: pid=$d_pid nice=$d_nice ionice=$r_label")
       fi
     else
-      restored_lines+=("restore failed: pid=$d_pid nice=$d_nice")
+      restored_lines+=("$now restore failed: pid=$d_pid nice=$d_nice")
     fi
   else
     keep="${keep:+$keep }$entry"
@@ -574,9 +574,9 @@ EOF
 fi
 
 # --- append offender/action/hint/restored lines to this run's log --------------
-if [ -n "$off_list" ]; then echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; fi
-if [ -n "$act" ]; then echo "action: $act" >> "$LOG"; echo "action: $act"; fi
-if [ -n "$hint_line" ]; then echo "$hint_line" >> "$LOG"; echo "$hint_line"; fi
+if [ -n "$off_list" ]; then echo "$now offenders: $off_list" >> "$LOG"; echo "$now offenders: $off_list"; fi
+if [ -n "$act" ]; then echo "$now action: $act" >> "$LOG"; echo "$now action: $act"; fi
+if [ -n "$hint_line" ]; then echo "$now $hint_line" >> "$LOG"; echo "$now $hint_line"; fi
 if [ "${#restored_lines[@]}" -gt 0 ]; then
   printf '%s\n' "${restored_lines[@]}" >> "$LOG"
   printf '%s\n' "${restored_lines[@]}"
@@ -585,5 +585,5 @@ fi
 # persist mitigation state (single writer point at end of run)
 mstate_write
 
-[ "$any_warn" -eq 1 ] && echo "ALERT: see status=WARN lines above"
+[ "$any_warn" -eq 1 ] && echo "$now ALERT: see status=WARN lines above"
 exit 0

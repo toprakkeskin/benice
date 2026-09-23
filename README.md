@@ -163,37 +163,34 @@ sudo ./uninstall.sh           # stops the timer, removes units and binary
 sudo ./uninstall.sh --purge   # also removes config, logs and state
 ```
 
-## What beniced is allowed to touch
+## Security: what beniced may touch
 
-`beniced` runs as root, which is a sentence that should make you skeptical by
-default. So here is the fence it lives in — enforced by systemd itself, not by
-the script's good manners:
+Although beniced runs as root, it does so inside a small sandbox that systemd
+enforces on its behalf. The service can read the whole system, but it may
+write only to its own two directories, `/var/log/benice` and
+`/var/lib/benice`. A few of the rules that make this work:
 
-- `ProtectSystem=strict` — the entire filesystem is mounted read-only for the
-  service. The only places it may write are its own two directories,
-  `/var/log/benice` and `/var/lib/benice`.
-- `NoNewPrivileges=yes` — even if something went sideways inside the script,
-  it cannot gain more privileges than it already has.
-- `PrivateTmp=yes` — it gets its own private `/tmp`, invisible to other
-  services.
-- `ProtectHome=yes` — `/home` and `/root` are simply not there for it.
-- `UMask=0027` — every file it creates is group-readable at most, never
-  world-writable.
+- `ProtectSystem=strict` — the filesystem is mounted read-only for the
+  service, with the two directories above as the only exceptions.
+- `NoNewPrivileges=yes` — the service cannot gain additional privileges, no
+  matter what happens inside the script.
+- `PrivateTmp=yes` and `ProtectHome=yes` — the service sees its own private
+  `/tmp`, and neither `/home` nor `/root` are accessible to it.
+- `UMask=0027` — files it creates are readable by group at most, never by
+  everyone.
 
-None of this is enforced by the script's good manners — it is systemd doing
-the enforcement, and you do not have to take a README's word for it. Ask
-systemd directly what is active on your machine:
+You are welcome to verify this yourself rather than take the README's word
+for it:
 
 ```bash
 systemctl show beniced.service -p NoNewPrivileges -p ProtectSystem
 systemctl show beniced.service -p ReadWritePaths -p PrivateTmp
 ```
 
-The short version: the worst a hypothetical bug in beniced could do is write
-garbage into its own log and state files, or demote a process you could also
-demote by hand. It cannot rewrite your system, cannot read your home
-directory, and opens no network ports — everything it prints goes to the
-journal.
+In practice this means that even an unexpected bug in beniced could, at
+worst, write to its own log and state files or adjust the priority of a
+process — the rest of the system stays out of reach, and the service makes
+no network connections at all.
 
 ## Notes and small print
 
@@ -217,16 +214,18 @@ journal.
 
 ## Responsibility
 
-beniced is a small tool I wrote for my own homelab, shared in case it is
-useful to someone else. It runs as root and it changes process priorities —
-two things that deserve a little respect. Read the script before you run it;
-it is short, and there is deliberately nothing hidden in it.
+beniced is a small tool I wrote for my own homelab, shared in the hope that
+it may be useful to others as well. Since it runs with elevated privileges
+and adjusts process priorities, I would kindly ask you to read through the
+script before installing it — it is short, and there is nothing hidden in
+it.
 
-It is provided as-is, with no warranty of any kind. Whatever happens on your
-machine because you chose to run it — lost data, an angry service, a bad
-afternoon — is on you, not on the author. If that does not sound acceptable,
-do not install it. Reading the code first costs you ten minutes, and then you
-will know exactly what it does on your machine.
+The software is provided as-is, without any warranty. While I use it daily
+on my own machines, I unfortunately cannot take responsibility for any
+issues or data loss that may occur on your system. Please use it at your own
+discretion — and if you are trying it on an important machine, running it in
+observe-only mode (`MITIGATE=0`) for a few days first is a gentle way to get
+to know it.
 
 ## License
 

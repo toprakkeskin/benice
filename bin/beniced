@@ -487,7 +487,10 @@ tops_keys=$(printf '%s\n' "$tops" | awk 'NF{print $2}' | tr '\n' ' ')
 m_demoted_new=""
 for entry in ${m_demoted:-}; do
   demoted_parse "$entry"
-  proc_alive "$d_pid" "$d_start" || continue            # exited — drop silently
+  if ! proc_alive "$d_pid" "$d_start"; then
+    restored_lines+=("restored: pid=$d_pid nice=$d_nice (process had already exited or been killed — nothing to renice)")
+    continue                                    # exited — logged, then dropped
+  fi
   case " $tops_keys " in
     *" $d_pid:$d_start "*) d_clean=0 ;;                 # offender this run again
     *)                     d_clean=$((d_clean + 1)) ;;  # one more clean run

@@ -163,6 +163,38 @@ sudo ./uninstall.sh           # stops the timer, removes units and binary
 sudo ./uninstall.sh --purge   # also removes config, logs and state
 ```
 
+## What beniced is allowed to touch
+
+`beniced` runs as root, which is a sentence that should make you skeptical by
+default. So here is the fence it lives in — enforced by systemd itself, not by
+the script's good manners:
+
+- `ProtectSystem=strict` — the entire filesystem is mounted read-only for the
+  service. The only places it may write are its own two directories,
+  `/var/log/benice` and `/var/lib/benice`.
+- `NoNewPrivileges=yes` — even if something went sideways inside the script,
+  it cannot gain more privileges than it already has.
+- `PrivateTmp=yes` — it gets its own private `/tmp`, invisible to other
+  services.
+- `ProtectHome=yes` — `/home` and `/root` are simply not there for it.
+- `UMask=0027` — every file it creates is group-readable at most, never
+  world-writable.
+
+None of this is enforced by the script's good manners — it is systemd doing
+the enforcement, and you do not have to take a README's word for it. Ask
+systemd directly what is active on your machine:
+
+```bash
+systemctl show beniced.service -p NoNewPrivileges -p ProtectSystem
+systemctl show beniced.service -p ReadWritePaths -p PrivateTmp
+```
+
+The short version: the worst a hypothetical bug in beniced could do is write
+garbage into its own log and state files, or demote a process you could also
+demote by hand. It cannot rewrite your system, cannot read your home
+directory, and opens no network ports — everything it prints goes to the
+journal.
+
 ## Notes and small print
 
 - `ionice` is only fully honored by the BFQ scheduler. On other elevators
@@ -182,6 +214,19 @@ sudo ./uninstall.sh --purge   # also removes config, logs and state
   processes. It refuses to touch PID 1 and kernel threads.
 - Requirements are listed in [Prerequisites](#prerequisites) — the big one is
   PSI being present and enabled.
+
+## Responsibility
+
+beniced is a small tool I wrote for my own homelab, shared in case it is
+useful to someone else. It runs as root and it changes process priorities —
+two things that deserve a little respect. Read the script before you run it;
+it is short, and there is deliberately nothing hidden in it.
+
+It is provided as-is, with no warranty of any kind. Whatever happens on your
+machine because you chose to run it — lost data, an angry service, a bad
+afternoon — is on you, not on the author. If that does not sound acceptable,
+do not install it. Reading the code first costs you ten minutes, and then you
+will know exactly what it does on your machine.
 
 ## License
 

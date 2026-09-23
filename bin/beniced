@@ -51,6 +51,9 @@
 # window (from /proc/<pid>/io deltas) are logged as offN=… and — if
 # MITIGATE>=1 — demoted with `ionice -c3` + `renice 19`. Runs as root, so any
 # user's runaway process can be demoted (never PID 1/kernel threads).
+#   Before demotion the process's original nice AND its I/O class+priority
+#   (read back via `ionice -p`, ioprio_get) are recorded, so the demotion
+#   can later be undone EXACTLY (see Demotion recovery).
 #   Time-normalized threshold (F4): a process qualifies when its window delta
 #   is >= IO_TRIG_MBPS MiB *per window* (MBPS * window seconds); the offN
 #   label therefore reports MiB per window, not MB/s.
@@ -61,6 +64,9 @@
 #   out instead of being acted on.
 #   NOTE on sched: ionice is fully honored only by BFQ. If the active elevator
 #   is mq-deadline, ionice is mostly cosmetic; renice still helps the CPU side.
+#   After the first successful demotion on a non-BFQ elevator a ONE-TIME
+#   "hint: scheduler is <sched> — ionice demotion is fully binding only under
+#   bfq" line is emitted (once per mitigate.state lifetime, key hint_bfq=1).
 #
 # MITIGATE=2 pendulum (orphan-safe, F7): the intended frozen pid is recorded
 # in MSTATE BEFORE kill -STOP; an EXIT/TERM/INT trap SIGCONTs it, and the
@@ -68,12 +74,22 @@
 # SIGKILLed run heals on the next run. The freeze therefore lasts at most
 # until the end of the run that issued it (bounded, never inter-run).
 #
-# Demotion recovery (F6): each demoted pid is stored as
-# "pid:starttime:orig_nice". After 2 consecutive clean runs (no PSI trigger),
-# every recorded pid that still exists (starttime-verified) is reniced back
-# to orig_nice and its ionice set to best-effort class 2 priority 4 (the
-# original ionice class is not readable back portably — best effort);
-# exited pids are dropped.
+# Demotion recovery (F6 + I1/I2): each demoted pid is stored as
+# "pid:starttime:nice:iclass:iprio:clean" — the recorded nice AND I/O
+# class+level (iclass/iprio, read back via `ionice -p` before demotion)
+# allow an EXACT restore, plus a PER-ENTRY clean counter. On EVERY run each
+# entry's counter resets to 0 if its pid+starttime was among this run's
+# top I/O consumers (the tops set), else it increments; an entry that
+# reaches clean=2 is restored — REGARDLESS of the global trigger — so a
+# one-time victim caught in storm #1 is not held hostage by a chronic
+# offender that keeps re-triggering (per-entry fairness). Restore =
+# renice to the recorded nice + ionice to the recorded class/level
+# ("be:N" / "rt:N" / "idle"). A captured class of 0 ("none" — never
+# explicitly set) is restored as best-effort with the KERNEL-DERIVED
+# priority (cpu_nice + 20) / 5, logged as "ionice=be:N (kernel default)".
+# Legacy 3-field entries (pid:starttime:nice) parse with the old restore
+# defaults iclass=2 iprio=4 and start clean at 0. Exited pids are dropped
+# silently.
 #
 # ALERT rules (status=WARN, also emitted as a greppable "ALERT:" line):
 #   kernel_io_errors delta > 0        → device/kernel-level I/O failures
@@ -95,10 +111,18 @@
 #                      last=<epoch>               last mitigation pass (cooldown)
 #                      stopped_pid=<pid>          pid frozen by MITIGATE=2 (0=none)
 #                      stopped_start=<starttime>  its /proc/<pid>/stat starttime
-#                      clean=<n>                  consecutive runs without trigger
-#                      demoted=<pid>:<starttime>:<orig_nice> …  space-separated
+#                      hint_bfq=1                 non-BFQ hint already emitted
+#                      demoted=<pid>:<starttime>:<nice>:<iclass>:<iprio>:<clean> …
+#                                                 space-separated; iclass/iprio =
+#                                                 original I/O class+level
+#                                                 (iclass 0 = never set → the
+#                                                 kernel default is re-derived
+#                                                 at restore); clean = per-entry
+#                                                 consecutive clean runs
 #                    Pre-hardening files ("epoch pid" on one line) match no
-#                    key and are silently reset to defaults.
+#                    key and are silently reset to defaults. Old files with a
+#                    global "clean=" line and 3-field demoted entries upgrade
+#                    to the current format on the next write.
 #
 # Configuration: /etc/benice/benice.conf
 #   (template: config/benice.conf.example in the project repo)
@@ -171,23 +195,85 @@ proc_alive() {       # pid starttime -> true iff pid exists AND starttime matche
 }
 num_ok() { case ${1:-} in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
+# --- ionice readback + demoted-entry helpers (I1/I2) ---------------------------
+# `ionice -p <pid>` reads the kernel's current I/O priority back (ioprio_get):
+#   "none: prio 0"        class 0 — never explicitly set; the kernel derives
+#                          the effective level from the CPU nice at request
+#                          time: BE level = (nice + 20) / 5
+#   "idle"                class 3, level 0
+#   "best-effort: prio N" class 2, level N
+#   "realtime: prio N"    class 1, level N
+ionice_get() {       # pid -> prints "<iclass> <iprio>"; rc 1 = fallback used
+  local out cls pri
+  out=$(ionice -p "$1" 2>/dev/null) || { printf '2 4\n'; return 1; }
+  case $out in
+    idle|idle:*)    printf '3 0\n' ;  return 0 ;;
+    none|none:*)    printf '0 0\n' ;  return 0 ;;
+    best-effort:*)  cls=2 ;;
+    realtime:*)     cls=1 ;;
+    *)              printf '2 4\n' ;  return 1 ;;
+  esac
+  pri=${out##*prio }
+  case $pri in ''|*[!0-9]*) printf '2 4\n'; return 1 ;; esac
+  printf '%s %s\n' "$cls" "$pri"
+}
+demoted_parse() {    # entry -> d_pid d_start d_nice d_iclass d_iprio d_clean;
+                     # tolerant: legacy 3-field "p:s:n" gets the old restore
+                     # defaults iclass=2 iprio=4 and starts clean at 0
+  local e=$1
+  d_pid=${e%%:*};   e=${e#*:}
+  d_start=${e%%:*}; e=${e#*:}
+  d_nice=${e%%:*};  e=${e#*:}
+  d_iclass=2; d_iprio=4; d_clean=0
+  case $e in
+    *:*:*) d_iclass=${e%%:*}; e=${e#*:}; d_iprio=${e%%:*}; d_clean=${e#*:} ;;
+  esac
+  case $d_pid    in ''|*[!0-9]*) d_pid=0 ;;    esac
+  case $d_start  in ''|*[!0-9]*) d_start=0 ;;  esac
+  case $d_nice   in ''|*[!0-9]*) d_nice=0 ;;   esac
+  case $d_iclass in ''|*[!0-9]*) d_iclass=2 ;; esac
+  case $d_iprio  in ''|*[!0-9]*) d_iprio=4 ;;  esac
+  case $d_clean  in ''|*[!0-9]*) d_clean=0 ;;  esac
+  [ "$d_iclass" -gt 3 ] && d_iclass=2          # only classes 0-3 are real
+  [ "$d_iprio"  -gt 7 ] && d_iprio=4           # BE/RT levels are 0-7
+}
+restore_ionice() {   # pid nice iclass iprio -> sets r_label + r_kdef
+                     # rc 0 = applied · rc 1 = ionice failed (r_label "")
+  local pid=$1 nice=$2 iclass=$3 iprio=$4
+  r_kdef=0
+  if [ "$iclass" -eq 0 ]; then
+    iclass=2                                # never explicitly set: re-pin the
+    iprio=$(( (nice + 20) / 5 ))            # kernel-derived default BE level
+    r_kdef=1
+  fi
+  if [ "$iclass" -eq 3 ]; then
+    if ionice -c 3 -p "$pid" >/dev/null 2>&1; then r_label="idle"; return 0; fi
+    return 1
+  fi
+  if ionice -c "$iclass" -n "$iprio" -p "$pid" >/dev/null 2>&1; then
+    if [ "$iclass" -eq 1 ]; then r_label="rt:$iprio"; else r_label="be:$iprio"; fi
+    return 0
+  fi
+  return 1
+}
+
 # --- mitigation state (format documented in the header) -----------------------
 MSTATE="$LIB_DIR/mitigate.state"
-m_last=0; m_stopped_pid=0; m_stopped_start=0; m_clean=0; m_demoted=""
+m_last=0; m_stopped_pid=0; m_stopped_start=0; m_hint_bfq=0; m_demoted=""
 if [ -f "$MSTATE" ]; then
   while IFS= read -r mline; do
     case $mline in
       last=*)          num_ok "${mline#last=}"          && m_last=${mline#last=} ;;
       stopped_pid=*)   num_ok "${mline#stopped_pid=}"   && m_stopped_pid=${mline#stopped_pid=} ;;
       stopped_start=*) num_ok "${mline#stopped_start=}" && m_stopped_start=${mline#stopped_start=} ;;
-      clean=*)         num_ok "${mline#clean=}"         && m_clean=${mline#clean=} ;;
+      hint_bfq=*)      num_ok "${mline#hint_bfq=}"      && m_hint_bfq=${mline#hint_bfq=} ;;
       demoted=*)       m_demoted=${mline#demoted=} ;;
     esac
   done < "$MSTATE"
 fi
 mstate_write() {
-  printf 'last=%s\nstopped_pid=%s\nstopped_start=%s\nclean=%s\ndemoted=%s\n' \
-    "$m_last" "$m_stopped_pid" "${m_stopped_start:-0}" "$m_clean" "$m_demoted" \
+  printf 'last=%s\nstopped_pid=%s\nstopped_start=%s\nhint_bfq=%s\ndemoted=%s\n' \
+    "$m_last" "$m_stopped_pid" "${m_stopped_start:-0}" "$m_hint_bfq" "$m_demoted" \
     > "$MSTATE" 2>/dev/null || true
 }
 demoted_has() {      # pid starttime -> true if already on the demoted list
@@ -281,9 +367,6 @@ tops=$(awk 'NR==FNR{a[$1]=$3; st[$1]=$2; next}
 trig=0
 [ "$psi_max_full" -ge "$PSI_TRIG" ] && trig=1
 
-# F6: consecutive clean runs counter — drives demotion recovery
-if [ "$trig" -eq 0 ]; then m_clean=$((m_clean + 1)); else m_clean=0; fi
-
 # --- fs error count for one disk = sum over its partitions --------------------
 fs_err_of() {
   local dev=$1 total=0 pcnt f
@@ -376,8 +459,8 @@ for dev in $DISKS; do
   echo "$line" >> "$LOG"; echo "$line"
 done
 
-# --- offender reporting + reactive mitigation (global, process-level) ---------
-off_list=""; act=""
+# --- offender reporting (global, process-level) -------------------------------
+off_list=""; act=""; hint_line=""
 restored_lines=()
 min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 * win_s ))   # F4: MiB per window
 reported=0
@@ -395,6 +478,48 @@ $tops
 EOF
 fi
 
+# --- per-entry recovery counters (F6/I2): tick EVERY recorded entry, every run
+# (a re-offender resets to 0; a demoted pid that stays out of this run's tops
+# set earns one more clean run — covering triggered and clean runs alike; the
+# old single global clean counter let a chronic offender hold a one-time
+# victim hostage, per-entry counters restore the victim on its own merits)
+tops_keys=$(printf '%s\n' "$tops" | awk 'NF{print $2}' | tr '\n' ' ')
+m_demoted_new=""
+for entry in ${m_demoted:-}; do
+  demoted_parse "$entry"
+  proc_alive "$d_pid" "$d_start" || continue            # exited — drop silently
+  case " $tops_keys " in
+    *" $d_pid:$d_start "*) d_clean=0 ;;                 # offender this run again
+    *)                     d_clean=$((d_clean + 1)) ;;  # one more clean run
+  esac
+  m_demoted_new="${m_demoted_new:+$m_demoted_new }$d_pid:$d_start:$d_nice:$d_iclass:$d_iprio:$d_clean"
+done
+m_demoted=$m_demoted_new
+
+# --- demotion recovery (F6/I1): per-entry — restore at clean>=2 REGARDLESS of
+# the global trigger, renice+ionice EXACTLY to the recorded values
+keep=""
+for entry in ${m_demoted:-}; do
+  demoted_parse "$entry"
+  if [ "$d_clean" -ge 2 ]; then
+    proc_alive "$d_pid" "$d_start" || continue            # exited — drop silently
+    if renice -n "$d_nice" -p "$d_pid" >/dev/null 2>&1 \
+       && restore_ionice "$d_pid" "$d_nice" "$d_iclass" "$d_iprio"; then
+      if [ "$r_kdef" -eq 1 ]; then
+        restored_lines+=("restored: pid=$d_pid nice=$d_nice ionice=$r_label (kernel default)")
+      else
+        restored_lines+=("restored: pid=$d_pid nice=$d_nice ionice=$r_label")
+      fi
+    else
+      restored_lines+=("restore failed: pid=$d_pid nice=$d_nice")
+    fi
+  else
+    keep="${keep:+$keep }$entry"
+  fi
+done
+m_demoted=$keep
+
+# --- reactive mitigation: demote THIS run's new offenders ---------------------
 if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
   acted=0; acted_pids=""
   if [ $(( epoch - m_last )) -ge "$COOLDOWN" ]; then
@@ -405,10 +530,16 @@ if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
       proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
       [ -r "/proc/$pid/comm" ] || continue
       if [ "$MITIGATE" -ge 1 ]; then
-        # F6: remember the original nice once, so it can be restored later
+        # F6/I1: remember the original nice AND I/O class+level once, so the
+        # demotion can be undone exactly; the entry starts its per-entry
+        # clean counter at 0 (I2)
         if ! demoted_has "$pid" "$pstart"; then
           onice=$(proc_nice "$pid"); num_ok "$onice" || onice=0
-          m_demoted="${m_demoted:+$m_demoted }$pid:$pstart:$onice"
+          iop=$(ionice_get "$pid"); iop=${iop:-"2 4"}
+          o_iclass=${iop%% *}; o_iprio=${iop##* }
+          case $o_iclass in ''|*[!0-9]*) o_iclass=2 ;; esac
+          case $o_iprio  in ''|*[!0-9]*) o_iprio=4 ;;  esac
+          m_demoted="${m_demoted:+$m_demoted }$pid:$pstart:$onice:$o_iclass:$o_iprio:0"
         fi
         ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
           && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
@@ -428,7 +559,18 @@ $tops
 EOF
     if [ "$acted" -eq 1 ]; then
       act="${act:+$act }ionice+renice pids=$acted_pids"
-      act="$act (ionice fully binding only under bfq)"
+      # I3: one-time non-BFQ hint — once per mitigate.state lifetime
+      if [ "$m_hint_bfq" != "1" ]; then
+        h_sched=""
+        for hdev in $DISKS; do
+          hs=$(cat "/sys/block/$hdev/queue/scheduler" 2>/dev/null | awk -F'[][]' '{print $2}')
+          if [ -n "$hs" ]; then h_sched=$hs; break; fi
+        done
+        if [ -n "$h_sched" ] && [ "$h_sched" != "bfq" ]; then
+          hint_line="hint: scheduler is $h_sched — ionice demotion is fully binding only under bfq"
+          m_hint_bfq=1
+        fi
+      fi
     fi
     m_last=$epoch
   else
@@ -436,26 +578,10 @@ EOF
   fi
 fi
 
-# --- demotion recovery (F6): after 2 consecutive clean runs, restore ----------
-if [ "$trig" -eq 0 ] && [ "$m_clean" -ge 2 ] && [ -n "$m_demoted" ]; then
-  for entry in $m_demoted; do
-    rpid=${entry%%:*}; rrest=${entry#*:}; rstart=${rrest%%:*}; rnice=${rrest##*:}
-    if ! proc_alive "$rpid" "$rstart"; then
-      continue                                   # exited — just drop it
-    fi
-    if renice -n "$rnice" -p "$rpid" >/dev/null 2>&1; then
-      ionice -c 2 -n 4 -p "$rpid" >/dev/null 2>&1 || true   # best-effort
-      restored_lines+=("restored: pid=$rpid nice=$rnice")
-    else
-      restored_lines+=("restore failed: pid=$rpid nice=$rnice")
-    fi
-  done
-  m_demoted=""
-fi
-
-# --- append offender/action/restored lines to this run's log -------------------
+# --- append offender/action/hint/restored lines to this run's log --------------
 if [ -n "$off_list" ]; then echo "offenders: $off_list" >> "$LOG"; echo "offenders: $off_list"; fi
 if [ -n "$act" ]; then echo "action: $act" >> "$LOG"; echo "action: $act"; fi
+if [ -n "$hint_line" ]; then echo "$hint_line" >> "$LOG"; echo "$hint_line"; fi
 if [ "${#restored_lines[@]}" -gt 0 ]; then
   printf '%s\n' "${restored_lines[@]}" >> "$LOG"
   printf '%s\n' "${restored_lines[@]}"

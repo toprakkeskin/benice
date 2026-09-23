@@ -56,6 +56,48 @@ Every 5 minutes the timer fires and `beniced` does this:
 Everything is one `key=value` line per disk in a plain log file. No
 dashboard required.
 
+## Demotion and recovery, step by step
+
+The demote/restore mechanism is the part people usually want to understand
+in detail, so here it is with the actual values.
+
+When a PSI trigger fires, beniced records three things about each offender
+**before touching it**:
+
+- the original nice value (from `/proc/<pid>/stat`)
+- the original I/O class and level (from `ionice -p <pid>`)
+- the process start time (so a recycled PID is never confused with the
+  original one)
+
+It then demotes: nice → 19, ionice → idle.
+
+Every later run, each demoted process earns one clean point for every
+window in which it does not re-appear among the top I/O consumers. After
+two clean points the process is restored — nice goes back to the recorded
+original, ionice goes back to the recorded class and level, and the log
+gets a `restored:` line. A process that exits while demoted is logged as
+`restored: pid=4242 nice=0 (process had already exited or been killed)`
+and simply dropped — a new process always starts with default values.
+
+The lifecycle in one picture:
+
+    normal ──▶ demoted ──▶ (2 clean windows) ──▶ restored ──▶ normal
+                 │
+                 └─ process exits meanwhile ──▶ logged as restored (exited)
+
+And one run, end to end:
+
+    systemd timer (every 5 min)
+      └─▶ beniced run
+          ├─ snapshot A: per-process I/O + start times
+          ├─ sample PSI for 30 s
+          ├─ snapshot B
+          ├─ rank processes by I/O delta over the window
+          ├─ PSI full >= threshold?
+          │     yes ─▶ report offenders, demote top set (record originals)
+          │     no  ─▶ tick clean counters, restore whoever reached 2
+          └─ write one key=value line per disk
+
 ## Prerequisites
 
 The big one: **PSI (Pressure Stall Information) must be present and enabled.**
@@ -84,6 +126,44 @@ The rest is modest:
   `journalctl`)
 - root — beniced must be able to see and throttle every user's processes
 
+### The scheduler matters for demotion
+
+Demotion has two halves, enforced by different parts of the kernel:
+
+- the **CPU side** (`renice 19`) works everywhere, on every scheduler;
+- the **I/O side** (`ionice -c3`) is only fully honored by the **BFQ**
+  scheduler.
+
+Some history, because it explains the situation: in the single-queue days
+the CFQ scheduler applied `ionice` faithfully. Kernel 5.0 removed CFQ when
+the block layer moved to multiqueue, and the modern schedulers treat
+`ionice` differently:
+
+| scheduler | what a demoted process gets |
+|---|---|
+| `bfq` | the real thing — served only when nothing else wants the disk |
+| `mq-deadline` | partial (supported since kernel 5.18): a hint, not a guarantee |
+| `none` / `kyber` | effectively ignored |
+
+Check what your disks are running:
+
+```bash
+cat /sys/block/sda/queue/scheduler
+# e.g. "none [mq-deadline] kyber bfq"  — the bracketed entry is active
+```
+
+If it is not `bfq`, the installer will offer to switch the watched disks
+for you: it applies the change immediately and persists it with a udev
+rule. By hand, per boot:
+
+```bash
+echo bfq | sudo tee /sys/block/sda/queue/scheduler
+```
+
+Without BFQ beniced still works — the CPU-side `renice` keeps doing its
+job and every demotion is logged — but a demoted process keeps most of
+its I/O share.
+
 ## Installation
 
 ```bash
@@ -111,7 +191,7 @@ touches your existing config.
 | `/var/log/benice/benice.log` | one `key=value` line per disk, per run |
 | `/etc/logrotate.d/benice` | keeps the log from growing forever |
 | `/var/lib/benice/state.<dev>` | per-disk counters between runs, for deltas |
-| `/var/lib/benice/mitigate.state` | throttle bookkeeping (cooldowns, frozen pid, demoted pids + original nice) |
+| `/var/lib/benice/mitigate.state` | throttle bookkeeping (frozen pid, demoted pids + original nice and ionice) |
 | `/etc/systemd/system/beniced.service` | oneshot unit, runs as root |
 | `/etc/systemd/system/beniced.timer` | fires it every 5 minutes |
 
@@ -127,7 +207,6 @@ sourced fresh every time, no restart needed.
 | `PSI_WINDOW` / `PSI_STEP` | `30` / `5` | PSI sampling window and step (seconds) |
 | `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
-| `COOLDOWN` | `300` | minimum seconds between two mitigations |
 
 ## Reading the log
 
@@ -192,11 +271,11 @@ worst, write to its own log and state files or adjust the priority of a
 process — the rest of the system stays out of reach, and the service makes
 no network connections at all.
 
-## Notes and small print
+## General Notes
 
-- `ionice` is only fully honored by the BFQ scheduler. On other elevators
-  (mq-deadline is common) it is mostly cosmetic; `renice` always works on the
-  CPU side.
+- `ionice` demotion is only fully binding under BFQ — see
+  [the scheduler notes](#the-scheduler-matters-for-demotion) in
+  Prerequisites.
 - `MITIGATE=2` freezes the top offender until the next run. Crash-safe: the
   pid (plus its `/proc` start time and original nice) is written to the state
   file *before* the SIGSTOP, and every run starts by SIGCONT-ing whatever is

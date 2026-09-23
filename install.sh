@@ -11,6 +11,10 @@
 #   4. interactively asks which disks to watch (or accepts --disks "sda sdb",
 #      or falls back to the root disk when non-interactive); warns when PSI
 #      (/proc/pressure/io) is unavailable — stall detection needs psi=1
+#   4b. asks to switch the watched disks to the BFQ scheduler — beniced's
+#       ionice demotions are fully binding only under BFQ; on confirmation it
+#       writes /etc/udev/rules.d/61-benice-bfq.rules so BFQ persists across
+#       reboots (uninstall.sh removes the rule again)
 #   5. installs systemd units (system-wide, user-independent) and enables
 #      the 5-minute timer
 #
@@ -172,6 +176,75 @@ echo "    watching: $SELECTED"
 # persist DISKS= into the central config (replace existing line, keep the rest)
 sed -i '/^DISKS=/d; /^DEV=/d' "$CONF_DST"
 printf 'DISKS="%s"\n' "$SELECTED" >> "$CONF_DST"
+
+# ------------------- BFQ scheduler step (ask-to-enable) --------------------
+# beniced demotes competing I/O via ionice, which is fully binding only under
+# the BFQ scheduler. Override hooks (mirroring PSI_PATH above) exist so the
+# logic can be exercised against a fake sysfs without touching the host:
+#   SYS_BLOCK (default /sys/block), UDEV_RULE (default below).
+SYS_BLOCK=${SYS_BLOCK:-/sys/block}
+UDEV_RULE=${UDEV_RULE:-/etc/udev/rules.d/61-benice-bfq.rules}
+
+active_sched() { # $1 = dev -> echo the ACTIVE scheduler (the bracketed entry)
+  local line
+  line=$(<"$SYS_BLOCK/$1/queue/scheduler") || return 1
+  if [[ $line =~ \[([^]]+)\] ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "$line"   # single-scheduler kernels print no brackets
+  fi
+}
+
+bfq_step() {
+  local first=${SELECTED%% *} sched sf d tmp ans
+  sched=$(active_sched "$first" 2>/dev/null || true)
+  if [[ $sched == bfq ]]; then
+    echo "    scheduler on watched disks: bfq — ionice demotions are fully binding ✓"
+    return 0
+  fi
+
+  # non-interactive (--disks given or no tty): skip the prompt, print the
+  # per-disk info line with the manual command instead
+  if [[ -n $DISKS_ARG || ! -t 0 ]]; then
+    for d in $SELECTED; do
+      sched=$(active_sched "$d" 2>/dev/null || echo unknown)
+      echo "    scheduler on $d is $sched. To make ionice fully binding run:"
+      echo "      echo bfq > $SYS_BLOCK/$d/queue/scheduler"
+    done
+    return 0
+  fi
+
+  echo "    scheduler on watched disks: $sched"
+  read -rp "Switch watched disks ($SELECTED) to the BFQ scheduler so ionice is fully binding? [y/N] " ans || ans=""
+  case ${ans,,} in
+    y|yes)
+      for d in $SELECTED; do
+        sf=$SYS_BLOCK/$d/queue/scheduler
+        # 'if' context keeps set -e alive when the write fails; report it
+        if [[ -w $sf ]] && echo bfq > "$sf" 2>/dev/null; then
+          echo "    $d: scheduler -> bfq"
+        else
+          echo "    WARNING: could not switch $d to bfq ($sf not writable)" >&2
+        fi
+      done
+      # persistence: one rule line per watched disk, regenerated wholesale
+      # on every run -> install-overwrite stays idempotent, no duplicates
+      tmp=$(mktemp)
+      for d in $SELECTED; do
+        printf 'ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="%s", ATTR{queue/scheduler}="bfq"\n' "$d" >> "$tmp"
+      done
+      install -m 0644 "$tmp" "$UDEV_RULE"
+      rm -f "$tmp"
+      echo "    BFQ enabled now + persisted across reboots (udev rule)"
+      echo "    rule file: $UDEV_RULE"
+      ;;
+    *)
+      echo "    keeping scheduler $sched — renice still works, ionice stays partially binding"
+      ;;
+  esac
+}
+bfq_step
+# ------------------------------------------------------- end BFQ scheduler step
 
 # ---------------------------------------------------------------- step 5
 echo "==> [5/5] installing systemd units and enabling the timer"

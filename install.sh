@@ -173,9 +173,15 @@ else
 fi
 echo "    watching: $SELECTED"
 
-# persist DISKS= into the central config (replace existing line, keep the rest)
+# persist DISKS= into the central config. The value is replaced in place,
+# right under its "# Disks to watch" comment; if the line or the comment is
+# missing entirely, the entry is appended at the end instead.
 sed -i '/^DISKS=/d; /^DEV=/d' "$CONF_DST"
-printf 'DISKS="%s"\n' "$SELECTED" >> "$CONF_DST"
+if grep -q '^# Disks to watch, space-separated' "$CONF_DST"; then
+  sed -i "/^# Disks to watch, space-separated/a DISKS=\"$SELECTED\"" "$CONF_DST"
+else
+  printf 'DISKS="%s"\n' "$SELECTED" >> "$CONF_DST"
+fi
 
 # ------------------- BFQ scheduler step (ask-to-enable) --------------------
 # beniced demotes competing I/O via ionice, which is fully binding only under

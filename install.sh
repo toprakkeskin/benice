@@ -16,7 +16,7 @@
 #       writes /etc/udev/rules.d/61-benice-bfq.rules so BFQ persists across
 #       reboots (uninstall.sh removes the rule again)
 #   5. installs systemd units (system-wide, user-independent) and enables
-#      the 5-minute timer
+#      the one-minute timer
 #
 # Usage:
 #   sudo ./install.sh                       # interactive disk prompt
@@ -57,16 +57,18 @@ install -m 0755 "$SRC_DIR/bin/beniced" "$BIN_DST"
 echo "==> [2/5] creating runtime directories"
 install -d -m 0755 "$CONF_DIR" "$LIB_DIR" "$LOG_DIR"
 
-# log rotation for the append-only log (weekly, keep 8, no daemon restart
-# needed thanks to copytruncate). Idempotent: never clobber a user-customized
+# log rotation for the append-only log (daily, keep 14, early-rotate at
+# 20 MiB — sized for the one-minute cadence; no daemon restart needed
+# thanks to copytruncate). Idempotent: never clobber a user-customized
 # stanza — only write it when absent.
 if [[ -f $LOGROTATE_DST ]]; then
   echo "    logrotate stanza already exists — keeping $LOGROTATE_DST"
 else
   cat > "$LOGROTATE_DST" <<'EOF'
 /var/log/benice/benice.log {
-    weekly
-    rotate 8
+    daily
+    rotate 14
+    maxsize 20M
     copytruncate
     compress
     missingok

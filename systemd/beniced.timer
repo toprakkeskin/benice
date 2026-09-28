@@ -1,9 +1,9 @@
 [Unit]
-Description=Run beniced every 5 minutes
+Description=Run beniced every minute
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnBootSec=90s
+OnUnitActiveSec=60s
 Unit=beniced.service
 
 [Install]

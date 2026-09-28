@@ -134,6 +134,10 @@
 #   IO_TRIG_MBPS=5     min MiB accumulated over the PSI window for a process
 #                      to be reported/throttled (time-normalized from MiB/s;
 #                      the log label shows MiB per window)
+#   MEM_TRIG=40        /proc/pressure/memory "some avg10" % that raises the
+#                      MEM_HIGH alert (clamped to a minimum of 1)
+#   MEM_AVAIL_MIN=750  MemAvailable floor in MiB — at or under it MEM_HIGH
+#                      fires (the Sep-28 thrash-death guardrail)
 #   MITIGATE=0|1|2     0 observe only · 1 ionice+renice offenders (default)
 #                      2 additionally SIGSTOP the top offender until the end
 #                      of the run (orphan-safe pendulum — see above; do NOT
@@ -170,12 +174,18 @@ PSI_TRIG=${PSI_TRIG:-25}
 PSI_WINDOW=${PSI_WINDOW:-15}
 PSI_STEP=${PSI_STEP:-3}
 IO_TRIG_MBPS=${IO_TRIG_MBPS:-5}
+MEM_TRIG=${MEM_TRIG:-40}
+MEM_AVAIL_MIN=${MEM_AVAIL_MIN:-750}
 MITIGATE=${MITIGATE:-1}
 
 # F11: clamp PSI_TRIG to >= 1 so the "0 >= 0" always-true seam is gone
 case $PSI_TRIG in ''|*[!0-9]*) PSI_TRIG=25 ;; esac
 [ "$PSI_TRIG" -lt 1 ] && PSI_TRIG=1
 case $IO_TRIG_MBPS in ''|*[!0-9]*) IO_TRIG_MBPS=5 ;; esac
+case $MEM_TRIG in ''|*[!0-9]*) MEM_TRIG=40 ;; esac
+[ "$MEM_TRIG" -lt 1 ] && MEM_TRIG=1
+case $MEM_AVAIL_MIN in ''|*[!0-9]*) MEM_AVAIL_MIN=750 ;; esac
+[ "$MEM_AVAIL_MIN" -lt 0 ] && MEM_AVAIL_MIN=0
 
 # ensure runtime dirs exist (self-healing; installer normally creates them)
 mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
@@ -351,6 +361,7 @@ snap_io > "$TMP_A"
 
 # --- PSI sampling window ------------------------------------------------------
 psi_max_some=0; psi_max_full=0
+psi_mem_max_some=0; psi_mem_max_full=0; mem_avail_min_kb=9999999
 psi_ok=1
 if [ ! -r /proc/pressure/io ]; then
   psi_ok=0    # F1: stall detection inactive — say so, loudly
@@ -362,10 +373,23 @@ else
     s_some=${s% *}; s_full=${s#* }
     [ "${s_some:-0}" -gt "$psi_max_some" ] && psi_max_some=$s_some
     [ "${s_full:-0}"  -gt "$psi_max_full" ] && psi_max_full=$s_full
+    m=$(awk '/^some/{v=$2} /^full/{f=$2} END{sub("avg10=","",v); sub("avg10=","",f); printf "%d %d", v+0, f+0}' /proc/pressure/memory 2>/dev/null)
+    m_some=${m% *}; m_full=${m#* }
+    case ${m_some:-0} in ''|*[!0-9]*) m_some=0 ;; esac
+    case ${m_full:-0} in ''|*[!0-9]*) m_full=0 ;; esac
+    [ "$m_some" -gt "$psi_mem_max_some" ] && psi_mem_max_some=$m_some
+    [ "$m_full" -gt "$psi_mem_max_full" ] && psi_mem_max_full=$m_full
+    avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    case ${avail:-0} in ''|*[!0-9]*) avail=0 ;; esac
+    [ "$avail" -gt 0 ] && [ "$avail" -lt "$mem_avail_min_kb" ] && mem_avail_min_kb=$avail
     [ "$waited" -ge "$PSI_WINDOW" ] && break
     sleep "$PSI_STEP"; waited=$((waited + PSI_STEP))
   done
 fi
+[ "$mem_avail_min_kb" -eq 9999999 ] && mem_avail_min_kb=0   # meminfo unreadable
+mem_avail_mb=$(( mem_avail_min_kb / 1024 ))
+# top-3 RSS processes right now — the "who is eating the RAM" snapshot
+mem_top=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | awk 'NR<=3 && $1>1024 {printf "%s%s:%dM", s2, $2, $1/1024; s2=","}')
 snap_io > "$TMP_B"
 win_end=$(date +%s)
 win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1
@@ -458,14 +482,20 @@ for dev in $DISKS; do
   if [ "$trig" -eq 1 ]; then
     alerts="${alerts:+$alerts }PSI_HIGH=${psi_max_full}%"; status=WARN
   fi
+  # memory guardrails (P3): memory pressure at/above MEM_TRIG, or free memory
+  # at/below MEM_AVAIL_MIN, is the early signature of the Sep-28 thrash death
+  if [ "$psi_mem_max_some" -ge "$MEM_TRIG" ] \
+     || { [ "$mem_avail_min_kb" -gt 0 ] && [ "$mem_avail_min_kb" -le $(( MEM_AVAIL_MIN * 1024 )) ]; }; then
+    alerts="${alerts:+$alerts }MEM_HIGH=some=${psi_mem_max_some}% avail=${mem_avail_mb}MB"; status=WARN
+  fi
   # F1: PSI missing → WARN + MISSING_PSI on every emitted line
   if [ "$psi_ok" -eq 0 ]; then
     alerts="${alerts:+$alerts }MISSING_PSI"; status=WARN
   fi
   [ "$status" = "WARN" ] && any_warn=1
 
-  line=$(printf '%s dev=%s load_1m=%s load_5m=%s load_15m=%s in_flight=%d iops_read=%s iops_write=%s busy_ms_delta=%dms util_pct=%d iowait_pct=%s kernel_io_errors=%d fs_errors=%d psi_io_some_max=%d psi_io_full_max=%d sched=%s status=%s' \
-    "$now" "$dev" "$load1" "$load5" "$load15" "$ifl" "$iops_r" "$iops_w" "$busy_delta" "$util_pct" "$iowait_pct" "$ioerr" "$fs_err" "$psi_max_some" "$psi_max_full" "$sched" "$status")
+  line=$(printf '%s dev=%s load_1m=%s load_5m=%s load_15m=%s in_flight=%d iops_read=%s iops_write=%s busy_ms_delta=%dms util_pct=%d iowait_pct=%s kernel_io_errors=%d fs_errors=%d psi_io_some_max=%d psi_io_full_max=%d psi_mem_some_max=%d psi_mem_full_max=%d mem_avail_mb=%d mem_top=%s sched=%s status=%s' \
+    "$now" "$dev" "$load1" "$load5" "$load15" "$ifl" "$iops_r" "$iops_w" "$busy_delta" "$util_pct" "$iowait_pct" "$ioerr" "$fs_err" "$psi_max_some" "$psi_max_full" "$psi_mem_max_some" "$psi_mem_max_full" "$mem_avail_mb" "$mem_top" "$sched" "$status")
   [ -n "$alerts" ] && line="$line alerts=\"$alerts\""
   echo "$line" >> "$LOG"; echo "$line"
 done

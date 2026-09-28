@@ -206,6 +206,7 @@ sourced fresh every time, no restart needed.
 | `PSI_TRIG` | `25` | PSI "full" avg10 % above which a stall is declared |
 | `PSI_WINDOW` / `PSI_STEP` | `15` / `3` | PSI sampling window and step (seconds) |
 | `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
+| `MEM_TRIG` / `MEM_AVAIL_MIN` | `40` / `750` | memory-pressure alert threshold (%) / MemAvailable floor (MiB) that raise `MEM_HIGH` |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 
 ## Reading the log

@@ -40,6 +40,14 @@ PSI_STEP=3
 
 IO_TRIG_MBPS=5
 
+# ---- memory guardrails ------------------------------------------------------
+# beniced also watches memory pressure (/proc/pressure/memory) and free
+# memory. MEM_HIGH is raised when memory "some" avg10 reaches MEM_TRIG
+# percent or MemAvailable drops to MEM_AVAIL_MIN MiB.
+
+MEM_TRIG=40
+MEM_AVAIL_MIN=750
+
 # ---- how hard to respond ----------------------------------------------------
 # MITIGATE controls what happens to reported offenders:
 #   0 = observe only — offenders are logged, nothing is changed

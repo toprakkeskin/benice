@@ -36,7 +36,7 @@ goes down. That is what you are looking at.
 
 ## How it works
 
-Every 5 minutes the timer fires and `beniced` does this:
+Every minute the timer fires and `beniced` does this:
 
 1. Reads device counters from `/proc/diskstats` (IOPS, busy time, in-flight
    requests), plus load, iowait and error counters.
@@ -87,7 +87,7 @@ The lifecycle in one picture:
 
 And one run, end to end:
 
-    systemd timer (every 5 min)
+    systemd timer (every 1 min)
       └─▶ beniced run
           ├─ snapshot A: per-process I/O + start times
           ├─ sample PSI for 30 s
@@ -171,7 +171,7 @@ sudo ./install.sh
 ```
 
 The installer asks which disks you want to watch (it lists them, and marks
-the root disk), installs a systemd unit and a 5-minute timer, drops a
+the root disk), installs a systemd unit and a one-minute timer, drops a
 logrotate stanza for the log, warns you if PSI looks unavailable on this
 kernel, and enables everything. For unattended setups:
 
@@ -193,7 +193,7 @@ touches your existing config.
 | `/var/lib/benice/state.<dev>` | per-disk counters between runs, for deltas |
 | `/var/lib/benice/mitigate.state` | throttle bookkeeping (frozen pid, demoted pids + original nice and ionice) |
 | `/etc/systemd/system/beniced.service` | oneshot unit, runs as root |
-| `/etc/systemd/system/beniced.timer` | fires it every 5 minutes |
+| `/etc/systemd/system/beniced.timer` | fires it every minute |
 
 ## Configuration
 
@@ -204,7 +204,7 @@ sourced fresh every time, no restart needed.
 |---|---|---|
 | `DISKS` | `sda` | space-separated list of devices to watch |
 | `PSI_TRIG` | `25` | PSI "full" avg10 % above which a stall is declared |
-| `PSI_WINDOW` / `PSI_STEP` | `30` / `5` | PSI sampling window and step (seconds) |
+| `PSI_WINDOW` / `PSI_STEP` | `15` / `3` | PSI sampling window and step (seconds) |
 | `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 

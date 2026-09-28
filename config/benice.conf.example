@@ -26,11 +26,12 @@ PSI_TRIG=25
 
 # ---- how carefully to look --------------------------------------------------
 # beniced samples PSI every PSI_STEP seconds for PSI_WINDOW seconds in
-# total and keeps the highest values it saw. Longer windows catch bursts
-# that a single glance would miss (each run takes PSI_WINDOW + ~2s).
+# total and keeps the highest values it saw. Short windows keep the run
+# itself short: the timer fires every minute, so at most about a minute
+# of storm goes unseen (each run takes PSI_WINDOW + a few seconds).
 
-PSI_WINDOW=30
-PSI_STEP=5
+PSI_WINDOW=15
+PSI_STEP=3
 
 # ---- who is to blame --------------------------------------------------------
 # During a declared stall, a process is reported (and demoted, see

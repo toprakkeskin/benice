@@ -129,8 +129,8 @@
 #                      (deprecated alias: DEV=sda)
 #   PSI_TRIG=25        /proc/pressure/io "full avg10" % that counts as a stall
 #                      (clamped to a minimum of 1)
-#   PSI_WINDOW=30      seconds spent sampling PSI per run
-#   PSI_STEP=5         seconds between PSI samples
+#   PSI_WINDOW=15      seconds spent sampling PSI per run
+#   PSI_STEP=3         seconds between PSI samples
 #   IO_TRIG_MBPS=5     min MiB accumulated over the PSI window for a process
 #                      to be reported/throttled (time-normalized from MiB/s;
 #                      the log label shows MiB per window)
@@ -138,6 +138,21 @@
 #                      2 additionally SIGSTOP the top offender until the end
 #                      of the run (orphan-safe pendulum — see above; do NOT
 #                      use on services that must stay responsive!)
+#
+#   Cadence: the unit fires every minute; a run takes PSI_WINDOW plus a
+#   few seconds of accounting, so the loop is blind for well under a
+#   minute — sized against the BCM2835 watchdog's 1-minute hardware
+#   timeout (Sep 28 reset: a storm outlived the 5-minute cadence and
+#   starved the watchdog).
+#
+#   Storm hardenings from the same post-mortem:
+#   - below-threshold valve: when a stall is declared but no process
+#     crossed IO_TRIG_MBPS (fragmented multi-process storm), the single
+#     largest I/O consumer is demoted anyway (log: valve=...)
+#   - descendant demotion: an offender's whole process tree is demoted
+#     with it (each recorded individually and restored on its own
+#     merits) — demoting only the orchestrator left its running
+#     children untouched
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -152,8 +167,8 @@ LOG="$LOG_DIR/benice.log"
 DISKS=${DISKS:-${DEV:-sda}}
 
 PSI_TRIG=${PSI_TRIG:-25}
-PSI_WINDOW=${PSI_WINDOW:-30}
-PSI_STEP=${PSI_STEP:-5}
+PSI_WINDOW=${PSI_WINDOW:-15}
+PSI_STEP=${PSI_STEP:-3}
 IO_TRIG_MBPS=${IO_TRIG_MBPS:-5}
 MITIGATE=${MITIGATE:-1}
 
@@ -474,6 +489,26 @@ $tops
 EOF
 fi
 
+# W1: below-threshold safety valve — a stall was declared but no process
+# crossed min_bytes (a fragmented storm spread over many small consumers).
+# Left alone, the run would report and demote nothing; demote the single
+# largest I/O consumer instead — under a declared stall it is the best
+# candidate by definition (Sep 28: PSI full=26% with zero demotions).
+valve_pid=""
+if [ "$trig" -eq 1 ] && [ "$reported" -eq 0 ]; then
+  read -r vd vpentry <<EOF
+$tops
+EOF
+  vpid=${vpentry%%:*}
+  if [ -n "$vd" ] && [ "$vd" -gt 0 ] && [ "$vpid" -gt 2 ] && [ -r "/proc/$vpid/comm" ]; then
+    vmb=$(( vd / (1024 * 1024) ))
+    vcomm=$(cat "/proc/$vpid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')
+    off_list="off1=${vpid}:${vcomm}:${vmb}MiB"
+    reported=1
+    valve_pid=$vpid
+  fi
+fi
+
 # --- per-entry recovery counters (F6/I2): tick EVERY recorded entry, every run
 # (a re-offender resets to 0; a demoted pid that stays out of this run's tops
 # set earns one more clean run — covering triggered and clean runs alike; the
@@ -518,13 +553,38 @@ for entry in ${m_demoted:-}; do
 done
 m_demoted=$keep
 
+desc_pids() {         # root pid -> transitive descendant pids (depth-capped)
+  local frontier="$1" seen=" $1 " out="" next="" depth=0 pp cid np
+  while [ -n "$frontier" ] && [ "$depth" -lt 8 ]; do
+    depth=$((depth + 1)); next=""
+    for np in $frontier; do
+      while read -r pp cid; do
+        [ "$pp" = "$np" ] || continue
+        case " $seen " in *" $cid "*) continue ;; esac
+        seen="$seen $cid"; out="$out${out:+ }$cid"; next="$next${next:+ }$cid"
+      done <<EOF
+$PPID_MAP
+EOF
+    done
+    frontier=$next
+  done
+  printf '%s\n' "$out"
+}
+
 # --- reactive mitigation: demote THIS run's new offenders ---------------------
 if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
-  acted=0; acted_pids=""
+  acted=0; desc_acted=0; acted_pids=""
+  # one pid->ppid map for the descendant walk (built once per run)
+  PPID_MAP=$(for f in /proc/[0-9]*/stat; do
+    pline=$(cat "$f" 2>/dev/null) || continue
+    p=${pline%% *}; rest=${pline##*) }
+    read -r _ pp _ <<<"$rest"
+    printf '%s %s\n' "$pp" "$p"
+  done 2>/dev/null)
   while read -r d pentry; do
     pid=${pentry%%:*}; pstart=${pentry##*:}
     [ "$pid" -le 2 ] && continue
-    [ "$d" -lt "$min_bytes" ] && continue
+    [ "$d" -lt "$min_bytes" ] && [ "$pid" != "$valve_pid" ] && continue
     proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
     [ -r "/proc/$pid/comm" ] || continue
     if [ "$MITIGATE" -ge 1 ]; then
@@ -541,6 +601,25 @@ if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
       fi
       ionice -c 3 -p "$pid" 2>/dev/null && renice -n 19 -p "$pid" >/dev/null 2>&1 \
         && { acted=1; acted_pids="${acted_pids:+$acted_pids,}$pid"; }
+      # W2: demote the offender's descendants too — demoting an orchestrator
+      # (a shell, a scheduler) does not touch its already-running children,
+      # which is how the Sep 28 storm outlived the demotion of its parent.
+      # Each descendant is recorded individually and restored on its own
+      # merits later; one that keeps doing I/O re-qualifies as an offender
+      # itself, so its clean counter just resets.
+      for dpid in $(desc_pids "$pid"); do
+        [ "$dpid" -le 2 ] && continue
+        dstart=$(proc_starttime "$dpid") || continue
+        demoted_has "$dpid" "$dstart" && continue
+        donice=$(proc_nice "$dpid"); num_ok "$donice" || donice=0
+        diop=$(ionice_get "$dpid"); diop=${diop:-"2 4"}
+        d_iclass=${diop%% *}; d_iprio=${diop##* }
+        case $d_iclass in ''|*[!0-9]*) d_iclass=2 ;; esac
+        case $d_iprio  in ''|*[!0-9]*) d_iprio=4 ;;  esac
+        m_demoted="${m_demoted:+$m_demoted }$dpid:$dstart:$donice:$d_iclass:$d_iprio:0"
+        ionice -c 3 -p "$dpid" 2>/dev/null && renice -n 19 -p "$dpid" >/dev/null 2>&1 \
+          && { acted_pids="${acted_pids:+$acted_pids,}$dpid"; desc_acted=$((desc_acted + 1)); }
+      done
     fi
     if [ "$MITIGATE" -ge 2 ]; then
       stopped_pid=$pid; stopped_start=$pstart
@@ -557,6 +636,8 @@ $tops
 EOF
   if [ "$acted" -eq 1 ]; then
     act="${act:+$act }ionice+renice pids=$acted_pids"
+    [ "$desc_acted" -gt 0 ] && act="$act (+$desc_acted descendants)"
+    [ -n "$valve_pid" ] && act="$act valve=below-threshold-top-consumer"
     # I3: one-time non-BFQ hint — once per mitigate.state lifetime
     if [ "$m_hint_bfq" != "1" ]; then
       h_sched=""

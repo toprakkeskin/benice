@@ -4,7 +4,7 @@
 # default value — edit a value and it applies on the next run. Missing
 # lines fall back to the built-in defaults shown here.
 #
-# The one-sentence version: every 5 minutes beniced samples how badly the
+# The one-sentence version: every minute beniced samples how badly the
 # watched disks are stalling; when tasks are blocked on I/O above a
 # threshold, the processes that moved the most data get their I/O and CPU
 # priority lowered until the pressure has stayed away for a while.

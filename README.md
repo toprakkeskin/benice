@@ -292,6 +292,29 @@ no network connections at all.
 - Requirements are listed in [Prerequisites](#prerequisites) — the big one is
   PSI being present and enabled.
 
+## benice and the kernel OOM killer
+
+OOM stands for **Out Of Memory**. The kernel's OOM killer is the last line of
+defense: when RAM *and* swap are exhausted it picks a process by an
+`oom_score` heuristic — roughly "biggest memory hog wins" — and kills it. Two
+things make it a poor guardian on a small box: by the time it fires the
+system has usually been thrashing for a while (everything is already slow or
+stuck), and the score is blind to *value* — it may kill your database while
+the runaway agent that caused the pressure survives.
+
+benice is the earlier, better-aimed layer:
+
+- it detects **pressure** (I/O via PSI, memory via `/proc/pressure/memory`)
+  long before RAM is gone and names/demotes the actual offenders;
+- the `user-1000.slice` memory guardrails (companion report:
+  `~/homelab/reports/2026-09-28-system-resource-limits.md`) guarantee that IF
+  an OOM kill ever becomes necessary it happens **inside the slice** — the
+  fattest runaway agent dies, SSH and system services survive;
+- the hardware watchdog is the final backstop if even that fails.
+
+In short: benice prevents, the OOM killer executes as a last resort, the
+watchdog reboots what even that could not save.
+
 ## Responsibility
 
 beniced is a small tool I wrote for my own homelab, shared in the hope that

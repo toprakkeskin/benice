@@ -32,6 +32,26 @@ rm -f /etc/logrotate.d/benice
 echo "==> removing udev rule (BFQ persistence)"
 rm -f /etc/udev/rules.d/61-benice-bfq.rules
 
+echo "==> checking memory guardrails drop-in"
+GUARD_DST=/etc/systemd/system/user-1000.slice.d/memory-limits.conf
+if [[ -f $GUARD_DST ]]; then
+  echo "    found: $GUARD_DST (MemoryHigh/MemoryMax on user-1000.slice)"
+  if [[ -t 0 ]]; then
+    read -rp "    remove the guardrails as well? [y/N]: " gans
+  else
+    gans=""
+    echo "    non-interactive session — keeping them (delete the file manually)"
+  fi
+  if [[ $gans =~ ^[Yy] ]]; then
+    rm -f "$GUARD_DST"
+    rmdir /etc/systemd/system/user-1000.slice.d 2>/dev/null || true
+    systemctl daemon-reload
+    echo "    guardrails removed"
+  else
+    echo "    kept — limits stay active"
+  fi
+fi
+
 if [[ $PURGE -eq 1 ]]; then
   echo "==> purging central data"
   rm -rf /etc/benice /var/lib/benice /var/log/benice

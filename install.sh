@@ -15,6 +15,9 @@
 #       ionice demotions are fully binding only under BFQ; on confirmation it
 #       writes /etc/udev/rules.d/61-benice-bfq.rules so BFQ persists across
 #       reboots (uninstall.sh removes the rule again)
+#   4c. optionally applies memory guardrails on the interactive user slice
+#       (MemoryHigh/MemoryMax, defaults 6G/7G — asks first; uninstall.sh
+#       detects them and offers to remove)
 #   5. installs systemd units (system-wide, user-independent) and enables
 #      the one-minute timer
 #
@@ -255,6 +258,34 @@ bfq_step
 # ------------------------------------------------------- end BFQ scheduler step
 
 # ---------------------------------------------------------------- step 5
+# -------- 4c. memory guardrails on the user slice (ask-to-apply) -------------
+# Sep-28 stability round: put a soft/hard memory cap on user-1000.slice so a
+# runaway agent or container cannot thrash the whole box. Idempotent (an
+# existing drop-in is kept as-is) and never applied silently: non-interactive
+# sessions skip, interactive sessions ask.
+GUARD_DST=/etc/systemd/system/user-1000.slice.d/memory-limits.conf
+echo "==> [4c/5] memory guardrails on the user slice"
+if [[ -f $GUARD_DST ]]; then
+  echo "    already present — keeping $GUARD_DST"
+elif [[ -n $DISKS_ARG || ! -t 0 ]]; then
+  echo "    non-interactive session — skipping (run again interactively to apply)"
+else
+  read -rp "    apply memory guardrails (MemoryHigh=6G, MemoryMax=7G on user-1000.slice)? [y/N]: " gans
+  if [[ $gans =~ ^[Yy] ]]; then
+    install -d -m 0755 /etc/systemd/system/user-1000.slice.d
+    cat > "$GUARD_DST" <<'EOF'
+[Slice]
+MemoryHigh=6G
+MemoryMax=7G
+EOF
+    systemctl daemon-reload
+    systemctl set-property --runtime user-1000.slice MemoryHigh=6G MemoryMax=7G
+    echo "    guardrails applied (6G soft / 7G hard)"
+  else
+    echo "    skipped — no guardrails written"
+  fi
+fi
+
 echo "==> [5/5] installing systemd units and enabling the timer"
 install -m 0644 "$SRC_DIR/systemd/beniced.service" "$UNIT_DIR/beniced.service"
 install -m 0644 "$SRC_DIR/systemd/beniced.timer"   "$UNIT_DIR/beniced.timer"

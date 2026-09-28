@@ -389,7 +389,8 @@ fi
 [ "$mem_avail_min_kb" -eq 9999999 ] && mem_avail_min_kb=0   # meminfo unreadable
 mem_avail_mb=$(( mem_avail_min_kb / 1024 ))
 # top-3 RSS processes right now — the "who is eating the RAM" snapshot
-mem_top=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | awk 'NR<=3 && $1>1024 {printf "%s%s:%dM", s2, $2, $1/1024; s2=","}')
+# (pid:comm:MB triplets, same pid:comm shape as the offenders: entries)
+mem_top=$(ps -eo pid=,rss=,comm= --sort=-rss 2>/dev/null | awk 'NR<=3 && $2>1024 {printf "%s%s:%s:%dM", s2, $1, $3, $2/1024; s2=","}')
 snap_io > "$TMP_B"
 win_end=$(date +%s)
 win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1

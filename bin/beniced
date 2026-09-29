@@ -351,7 +351,25 @@ epoch=$(date +%s)
 up_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)  # F9: monotonic clock
 num_ok "$up_now" || up_now=0
 load1=$(cut -d' ' -f1 /proc/loadavg); load5=$(cut -d' ' -f2 /proc/loadavg); load15=$(cut -d' ' -f3 /proc/loadavg)
-ioerr=$(journalctl -k --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+# F12: count kernel I/O errors INCREMENTALLY. The old full scan
+# (`journalctl -k | grep -c`) re-walked ~1 GB of journal files every run;
+# with a cold page cache that faulted in ~950 MB (USB SSD read storm, 84 s
+# runs, recurring "memory peak ~950 MB" — clean cache, but real reads).
+# --cursor-file makes journalctl show ONLY lines newer than the previous run;
+# the first run (no cursor yet) keeps the old since-boot semantics, so the
+# cumulative total keeps its meaning. Cumulative lives in kerr.count.
+KERR_FILE="$LIB_DIR/kerr.count"
+p_kerr=0
+[ -r "$KERR_FILE" ] && read -r p_kerr < "$KERR_FILE" 2>/dev/null
+case $p_kerr in ''|*[!0-9]*) p_kerr=0 ;; esac
+if [ -f "$LIB_DIR/kerr.cursor" ]; then
+  ioerr_delta=$(journalctl -k -q --cursor-file="$LIB_DIR/kerr.cursor" --no-pager 2>/dev/null \
+                | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+  ioerr=$(( p_kerr + ioerr_delta ))
+else
+  ioerr=$(journalctl -k --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+fi
+printf '%s\n' "$ioerr" > "$KERR_FILE" 2>/dev/null || true
 iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=${iowait_pct:-0}
 
 # --- I/O per-process snapshot helper -----------------------------------------

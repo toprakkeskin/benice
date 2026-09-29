@@ -171,6 +171,9 @@
 #     helper executed ~3200 times per run: 5.5 s CPU per run → ~0.3 s
 #   - F15: instance lock (flock on $LIB_DIR/beniced.lock) — an overlapping
 #     run exits immediately without doing any work; no stacking chains
+#   - F16: KERR_EVERY (default 1) — scan the kernel journal for I/O errors
+#     only every Nth run; each scan mmaps the journal tail (100-200 MB of
+#     clean page cache), production configs can amortize it to 1/5th
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -379,25 +382,42 @@ epoch=$(date +%s)
 up_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)  # F9: monotonic clock
 num_ok "$up_now" || up_now=0
 load1=$(cut -d' ' -f1 /proc/loadavg); load5=$(cut -d' ' -f2 /proc/loadavg); load15=$(cut -d' ' -f3 /proc/loadavg)
-# F12: count kernel I/O errors INCREMENTALLY. The old full scan
-# (`journalctl -k | grep -c`) re-walked ~1 GB of journal files every run;
-# with a cold page cache that faulted in ~950 MB (USB SSD read storm, 84 s
-# runs, recurring "memory peak ~950 MB" — clean cache, but real reads).
-# --cursor-file makes journalctl show ONLY lines newer than the previous run;
-# the first run (no cursor yet) keeps the old since-boot semantics, so the
-# cumulative total keeps its meaning. Cumulative lives in kerr.count.
+# F12 + F16: kernel I/O errors are counted INCREMENTALLY (cursor-file; the
+# old full scan re-walked ~1 GB of journal files, cold-faulting ~950 MB of
+# page cache) and only every KERR_EVERY runs. Each scan still mmaps the
+# journal tail (100-200 MB of clean page cache on this box), so production
+# configs can amortize it: KERR_EVERY=5 scans every 5th run and
+# kernel_io_errors trails by up to 5 minutes (fs_errors from /sys stay
+# per-run). Cumulative total + run sequence live in kerr.count.
 KERR_FILE="$LIB_DIR/kerr.count"
-p_kerr=0
-[ -r "$KERR_FILE" ] && read -r p_kerr < "$KERR_FILE" 2>/dev/null
+KERR_EVERY=${KERR_EVERY:-1}
+case $KERR_EVERY in ''|*[!0-9]*) KERR_EVERY=1 ;; esac
+[ "$KERR_EVERY" -lt 1 ] && KERR_EVERY=1
+p_kerr=0; p_seq=0
+[ -r "$KERR_FILE" ] && read -r p_kerr p_seq < "$KERR_FILE" 2>/dev/null
 case $p_kerr in ''|*[!0-9]*) p_kerr=0 ;; esac
-if [ -f "$LIB_DIR/kerr.cursor" ]; then
-  ioerr_delta=$(journalctl -k -q --cursor-file="$LIB_DIR/kerr.cursor" --no-pager 2>/dev/null \
-                | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
-  ioerr=$(( p_kerr + ioerr_delta ))
-else
-  ioerr=$(journalctl -k --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+case $p_seq  in ''|*[!0-9]*) p_seq=0  ;; esac
+this_seq=$(( p_seq + 1 ))
+scan=1
+if [ -f "$LIB_DIR/kerr.cursor" ] && [ "$this_seq" -gt "$KERR_EVERY" ]; then
+  scan=0                       # amortized run: carry the cumulative forward
 fi
-printf '%s\n' "$ioerr" > "$KERR_FILE" 2>/dev/null || true
+if [ "$scan" -eq 1 ]; then
+  if [ -f "$LIB_DIR/kerr.cursor" ]; then
+    ioerr_delta=$(journalctl -k -q --cursor-file="$LIB_DIR/kerr.cursor" --no-pager 2>/dev/null \
+                  | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+    ioerr=$(( p_kerr + ioerr_delta ))
+  else
+    # baseline (no cursor yet): full since-boot scan AND write the cursor —
+    # without --cursor-file here the cursor would never be created and every
+    # subsequent run would re-take the full-scan path (the Sep-29 bug that
+    # kept memory peaks at 150-200 MB).
+    ioerr=$(journalctl -k -q --cursor-file="$LIB_DIR/kerr.cursor" --no-pager 2>/dev/null | grep -ciE 'I/O error|EXT4-fs error|medium error|blk_update')
+  fi
+else
+  ioerr=$p_kerr
+fi
+printf '%s %s\n' "$ioerr" "$this_seq" > "$KERR_FILE" 2>/dev/null || true
 iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=${iowait_pct:-0}
 
 # --- I/O per-process snapshot helper -----------------------------------------
@@ -413,7 +433,7 @@ snap_io() {
     [ "$pid" = "$$" ] && continue
     [ "$pid" -le 2 ] && continue          # skip PID 1 and kernel threads
     st=""
-    if IFS= read -r s < "$p/stat" 2>/dev/null; then
+    if IFS= read -r s 2>/dev/null < "$p/stat"; then   # NB: silence BEFORE open — pids vanish between the glob and this read (line-400 journal spam)
       rest=${s##*) }                      # comm may contain spaces/parens
       # shellcheck disable=SC2086  # intentional word split on stat fields
       set -- ${rest}

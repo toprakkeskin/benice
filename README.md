@@ -206,6 +206,7 @@ sourced fresh every time, no restart needed.
 | `PSI_TRIG` | `25` | PSI "full" avg10 % above which a stall is declared |
 | `PSI_WINDOW` / `PSI_STEP` | `15` / `3` | PSI sampling window and step (seconds) |
 | `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
+| `KERR_EVERY` | `1` | run-interval for the kernel I/O error journal scan (F16): `5` scans every 5th run — `kernel_io_errors` trails by up to 5 min, page-cache cost drops 5× |
 | `MEM_TRIG` / `MEM_AVAIL_MIN` | `40` / `750` | memory-pressure alert threshold (%) / MemAvailable floor (MiB) that raise `MEM_HIGH` |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 
@@ -219,6 +220,9 @@ beniced watches I/O — it must not become an I/O problem itself:
   per run; with a cold page cache that faulted in ~950 MB on the USB SSD
   (84-second runs, recurring ~950 MB "memory peak" — clean page cache, but
   a real read storm). First run after boot keeps the old since-boot count.
+  `KERR_EVERY` (config, default 1) runs the scan only every Nth run when its
+  page-cache cost needs amortizing (kernel_io_errors then trails by up to N
+  minutes; `fs_errors` from /sys stay per-run).
 - **F13 — system processes are off-limits:** PID 1 and every process under
   `/system.slice` are excluded from offender ranking, the below-threshold
   valve, and demotion. `/proc/<pid>/io` rolls reaped children's I/O into the

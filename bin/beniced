@@ -169,6 +169,8 @@
 #     demoted for 2 minutes on a false signal)
 #   - F14: snap_io is fork-free (bash builtins only). The old cat+awk-per-pid
 #     helper executed ~3200 times per run: 5.5 s CPU per run → ~0.3 s
+#   - F15: instance lock (flock on $LIB_DIR/beniced.lock) — an overlapping
+#     run exits immediately without doing any work; no stacking chains
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -201,6 +203,20 @@ case $MEM_AVAIL_MIN in ''|*[!0-9]*) MEM_AVAIL_MIN=750 ;; esac
 
 # ensure runtime dirs exist (self-healing; installer normally creates them)
 mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
+
+# F15: instance lock — a second beniced (manual run, wrapper loop, a future
+# second timer) must exit immediately without touching anything. flock is
+# atomic, so two simultaneous starts cannot both pass the check (a pgrep
+# test can), and the kernel releases the lock when the holder dies — no
+# stale lock files to clean up. systemd serializes the timer's own unit;
+# this covers manual runs and any additional scheduling source.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"$LIB_DIR/beniced.lock"
+  if ! flock -n 9; then
+    echo "beniced: another instance holds the lock — exiting without work" >&2
+    exit 0
+  fi
+fi
 
 # --- /proc/<pid>/stat helpers -------------------------------------------------
 # comm (field 2) may contain spaces/parens — always parse AFTER the last ')'.

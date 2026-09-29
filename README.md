@@ -228,6 +228,11 @@ beniced watches I/O — it must not become an I/O problem itself:
 - **F14 — fork-free snapshot:** the per-process I/O snapshot uses bash
   builtins only. The old helper forked `cat` + `awk` per PID (~3200 execs per
   run): measured 5.5 s CPU per run → 0.3 s after the fix.
+- **F15 — instance lock:** an overlapping beniced (manual run, wrapper loop,
+  a second timer) takes an `flock` on `/var/lib/benice/beniced.lock` and exits
+  immediately without work if it is already held. Atomic — two simultaneous
+  starts cannot both pass — and the lock is released by the kernel when the
+  holder dies, so stale locks cannot pile up.
 
 ## Reading the log
 

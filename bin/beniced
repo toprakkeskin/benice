@@ -217,6 +217,21 @@ proc_alive() {       # pid starttime -> true iff pid exists AND starttime matche
 }
 num_ok() { case ${1:-} in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
+# F13: system processes are off-limits for demotion. /proc/<pid>/io rolls the
+# I/O of reaped children into the parent, which makes pid 1 and service
+# managers look like chronic top consumers (Sep 29: the below-threshold valve
+# demoted systemd plus 61 system services on exactly that false signal).
+# pid 1 lives in /init.scope — not system.slice — hence the explicit check.
+sys_proc() {         # pid -> true iff pid 1 or under /system.slice
+  [ "$1" = "1" ] && return 0
+  local cg
+  cg=$(cat "/proc/$1/cgroup" 2>/dev/null) || return 1
+  case $cg in
+    *:/system.slice|*:/system.slice/*) return 0 ;;
+  esac
+  return 1
+}
+
 # --- ionice readback + demoted-entry helpers (I1/I2) ---------------------------
 # `ionice -p <pid>` reads the kernel's current I/O priority back (ioprio_get):
 #   "none: prio 0"        class 0 — never explicitly set; the kernel derives
@@ -400,6 +415,16 @@ win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1
 tops=$(awk 'NR==FNR{a[$1]=$3; st[$1]=$2; next}
             ($1 in a) && ($2 == st[$1]) {d=$3-a[$1]; if(d>0) printf "%d %s:%s\n", d, $1, $2}' \
        "$TMP_A" "$TMP_B" | sort -rn | head -3)
+
+# F13: drop PID 1 and system.slice processes from the ranking — /proc/<pid>/io
+# rolls reaped children's I/O into the parent, so systemd (pid 1) and build
+# orchestrators always LOOK like top consumers. System services are the
+# unit/slice layer's job; benice demotes user workloads only.
+tops=$(printf '%s\n' "$tops" | while read -r d pentry; do
+  [ -n "$d" ] || continue
+  if sys_proc "${pentry%%:*}"; then continue; fi
+  printf '%s %s\n' "$d" "$pentry"
+done)
 trig=0
 [ "$psi_max_full" -ge "$PSI_TRIG" ] && trig=1
 

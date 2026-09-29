@@ -157,6 +157,18 @@
 #     with it (each recorded individually and restored on its own
 #     merits) — demoting only the orchestrator left its running
 #     children untouched
+#
+#   Self-I/O hygiene (Sep 29 investigation — see reports/benice/):
+#   - F12: kernel_io_errors is counted INCREMENTALLY via journalctl
+#     --cursor-file. The old per-run full scan re-walked ~1 GB of journal
+#     files; cold, that faulted in ~950 MB of page cache (USB SSD read
+#     storm, 84 s runs, recurring "memory peak ~950 MB" systemd reports)
+#   - F13: pid 1 and /system.slice processes are never ranked or demoted —
+#     /proc/<pid>/io rolls reaped children's I/O into parents, which once
+#     made the valve pick systemd as the "top consumer" (61 services
+#     demoted for 2 minutes on a false signal)
+#   - F14: snap_io is fork-free (bash builtins only). The old cat+awk-per-pid
+#     helper executed ~3200 times per run: 5.5 s CPU per run → ~0.3 s
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -376,14 +388,32 @@ iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=$
 # outputs "pid starttime total_bytes" lines (root can read every process);
 # the starttime column makes the A/B join PID-reuse-proof (F5)
 snap_io() {
-  local p pid b st
+  # F14: fork-free snapshot. The old helper spawned cat+awk per pid
+  # (~4 execs x ~800 pids per run — the largest CPU/wall cost under load).
+  # Output is unchanged: "pid starttime total_bytes".
+  local p pid s rest st k v total
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     [ "$pid" = "$$" ] && continue
     [ "$pid" -le 2 ] && continue          # skip PID 1 and kernel threads
-    st=$(proc_starttime "$pid") || continue
-    b=$(awk '/^(read|write)_bytes/{s+=$2} END{print s+0}' "$p/io" 2>/dev/null) || continue
-    [ "${b:-0}" -gt 0 ] && printf '%s %s %s\n' "$pid" "$st" "$b"
+    st=""
+    if IFS= read -r s < "$p/stat" 2>/dev/null; then
+      rest=${s##*) }                      # comm may contain spaces/parens
+      # shellcheck disable=SC2086  # intentional word split on stat fields
+      set -- ${rest}
+      st=${20:-}                          # NB: braced — $20 would mean ${2}+"0"
+    fi
+    [ -n "$st" ] || continue
+    total=0
+    # NB: silence stderr BEFORE opening <file> — as a non-root test run the
+    # open of other users' /proc/<pid>/io fails and bash would print one
+    # "Permission denied" line per pid otherwise.
+    while read -r k v; do
+      case $k in
+        read_bytes:|write_bytes:) total=$(( total + ${v:-0} )) ;;
+      esac
+    done 2>/dev/null < "$p/io" || continue
+    [ "$total" -gt 0 ] && printf '%s %s %s\n' "$pid" "$st" "$total"
   done
 }
 TMP_A=$(mktemp) ; TMP_B=$(mktemp)

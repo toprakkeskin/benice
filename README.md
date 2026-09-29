@@ -209,6 +209,26 @@ sourced fresh every time, no restart needed.
 | `MEM_TRIG` / `MEM_AVAIL_MIN` | `40` / `750` | memory-pressure alert threshold (%) / MemAvailable floor (MiB) that raise `MEM_HIGH` |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 
+## Self-I/O hygiene (F12–F14)
+
+beniced watches I/O — it must not become an I/O problem itself:
+
+- **F12 — incremental error counting:** kernel I/O errors are counted with
+  `journalctl --cursor-file`, so each run reads only lines newer than the
+  previous run. The old full-journal scan re-walked ~1 GB of journal files
+  per run; with a cold page cache that faulted in ~950 MB on the USB SSD
+  (84-second runs, recurring ~950 MB "memory peak" — clean page cache, but
+  a real read storm). First run after boot keeps the old since-boot count.
+- **F13 — system processes are off-limits:** PID 1 and every process under
+  `/system.slice` are excluded from offender ranking, the below-threshold
+  valve, and demotion. `/proc/<pid>/io` rolls reaped children's I/O into the
+  parent, so systemd and build orchestrators always LOOK like top consumers —
+  on 2026-09-29 the valve demoted systemd plus 61 system services on exactly
+  that false signal (auto-restored after 2 clean runs).
+- **F14 — fork-free snapshot:** the per-process I/O snapshot uses bash
+  builtins only. The old helper forked `cat` + `awk` per PID (~3200 execs per
+  run): measured 5.5 s CPU per run → 0.3 s after the fix.
+
 ## Reading the log
 
 ```text

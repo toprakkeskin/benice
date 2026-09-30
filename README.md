@@ -209,18 +209,18 @@ sourced fresh every time, no restart needed.
 | `PSI_TRIG` | `25` | PSI "full" avg10 % above which a stall is declared |
 | `PSI_WINDOW` / `PSI_STEP` | `15` / `3` | PSI sampling window and step (seconds) |
 | `IO_TRIG_MBPS` | `5` | minimum MiB a process must transfer during the PSI window to be flagged (the name is historical — the log label reports MiB per window) |
-| `KERR_EVERY` | `1` | run-interval for the kernel I/O error journal scan (F16): `5` scans every 5th run — `kernel_io_errors` trails by up to 5 min, page-cache cost drops 5× |
+| `KERR_EVERY` | `1` | run-interval for the kernel I/O error journal scan: `5` scans every 5th run — `kernel_io_errors` trails by up to 5 min, page-cache cost drops 5× |
 | `MEM_TRIG` / `MEM_AVAIL_MIN` | `40` / `750` | memory-pressure alert threshold (%) / MemAvailable floor (MiB) that raise `MEM_HIGH` |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 
-## Self-I/O hygiene and ranking internals (F12–F21)
+## Keeping beniced's own overhead in check
 
 beniced watches I/O — it must not become an I/O problem itself, and its
 verdicts must not be built on polluted counters. Each fix is collapsed;
 open the ones you care about.
 
 <details>
-<summary><b>F12 — incremental error counting</b> · journal reads without the read storm</summary>
+<summary>Counting kernel I/O errors incrementally</summary>
 
 Kernel I/O errors are counted with `journalctl --cursor-file`, so each run
 reads only lines newer than the previous run. The old full-journal scan
@@ -232,7 +232,7 @@ boot keeps the old since-boot count.
 </details>
 
 <details>
-<summary><b>F13 — system processes are off-limits</b> · the valve once demoted systemd</summary>
+<summary>Keeping systemd and system services out of the demotion list</summary>
 
 PID 1 and every process under `/system.slice` are excluded from offender
 ranking, the below-threshold valve, and demotion. `/proc/<pid>/io` rolls
@@ -244,7 +244,7 @@ plus 61 system services on exactly that false signal (auto-restored after
 </details>
 
 <details>
-<summary><b>F14 — fork-free snapshot</b> · 5.5 s → 0.3 s CPU per run</summary>
+<summary>Snapshotting process I/O without forking</summary>
 
 The per-process I/O snapshot uses bash builtins only. The old helper forked
 `cat` + `awk` per PID (~3200 execs per run): measured 5.5 s CPU per run.
@@ -252,7 +252,7 @@ The per-process I/O snapshot uses bash builtins only. The old helper forked
 </details>
 
 <details>
-<summary><b>F15 — instance lock</b> · overlapping runs exit in milliseconds</summary>
+<summary>Instance lock for overlapping runs</summary>
 
 An overlapping beniced (manual run, wrapper loop, a second timer) takes an
 `flock` on `/var/lib/benice/beniced.lock` and exits immediately without
@@ -264,7 +264,7 @@ this covers manual runs and extra scheduling sources.
 </details>
 
 <details>
-<summary><b>F16 — KERR_EVERY</b> · amortize the journal scan</summary>
+<summary>Spacing out the journal error scan</summary>
 
 Config (default 1): run the kernel error scan every Nth run. See the
 Configuration table.
@@ -272,12 +272,12 @@ Configuration table.
 </details>
 
 <details>
-<summary><b>F19 — delay-based ranking</b> · bytes lie, I/O-wait doesn't</summary>
+<summary>Ranking offenders by their own I/O wait</summary>
 
 Offenders and the valve rank by stat field 42
 (`delayacct_blkio_ticks` — per-process block-I/O wait), NOT by io bytes.
 Byte deltas inherit reaped children's I/O, which is why the ranking once
-accused systemd and build shells (see F13). io bytes stay reported (offN
+accused systemd and build shells (see the system-process guard above). io bytes stay reported (offN
 MiB) and remain the qualifying gate. With delay accounting off the ranking
 degrades gracefully to the old bytes ordering.
 
@@ -308,7 +308,7 @@ Fine print, measured on this box (kernel 6.18, runtime toggle):
 </details>
 
 <details>
-<summary><b>F20 — PSS in mem_top</b> · honest memory triplets</summary>
+<summary>Reporting proportional memory in mem_top</summary>
 
 The mem_top triplets report proportional set size (shared pages divided
 among sharers) instead of RSS (shared pages double-counted). Same
@@ -317,7 +317,7 @@ among sharers) instead of RSS (shared pages double-counted). Same
 </details>
 
 <details>
-<summary><b>F21 — storm deferral</b> · the watcher stays light when it matters</summary>
+<summary>Deferring the journal scan during storms</summary>
 
 When a run closes with `psi_io_full_max >= PSI_TRIG`, the kernel-error
 journal scan is deferred to the next calm run. The cursor makes this
@@ -338,7 +338,7 @@ how much of the interval the disk was busy; `psi_io_full_max` is the peak
 percentage of time tasks were *blocked* on I/O — if that climbs and
 `status=WARN` appears, the run names the culprit. The `mem_top=…` triplets
 report PSS — proportional memory, with shared pages split among sharers
-(F20): what each process really costs, not what it merely maps.
+— what each process really costs, not what it merely maps.
 
 When the pressure threshold trips, the offending runs get their own lines:
 

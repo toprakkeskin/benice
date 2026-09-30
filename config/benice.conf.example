@@ -47,7 +47,7 @@ IO_TRIG_MBPS=5
 
 MEM_TRIG=40
 MEM_AVAIL_MIN=750
-# How often (in runs) the kernel I/O error scan executes (F16). Each scan
+# How often (in runs) the kernel I/O error scan executes . Each scan
 # mmaps the journal tail (~100-200 MB of clean page cache on this box).
 # 1 = every run (exact, default); 5 = every 5th run (kernel_io_errors
 # trails by up to 5 minutes; fs_errors from /sys stay per-run).

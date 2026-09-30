@@ -33,7 +33,7 @@ rm -f /etc/logrotate.d/benice
 echo "==> removing udev rule (BFQ persistence)"
 rm -f /etc/udev/rules.d/61-benice-bfq.rules
 
-echo "==> removing task delay accounting conf (F19)"
+echo "==> removing task delay accounting conf "
 DA_CONF=/etc/sysctl.d/91-benice-delayacct.conf
 if [[ -f $DA_CONF ]]; then
   rm -f "$DA_CONF"

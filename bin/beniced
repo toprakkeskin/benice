@@ -54,10 +54,10 @@
 #   Before demotion the process's original nice AND its I/O class+priority
 #   (read back via `ionice -p`, ioprio_get) are recorded, so the demotion
 #   can later be undone EXACTLY (see Demotion recovery).
-#   Time-normalized threshold (F4): a process qualifies when its window delta
+#   Time-normalized threshold : a process qualifies when its window delta
 #   is >= IO_TRIG_MBPS MiB *per window* (MBPS * window seconds); the offN
 #   label therefore reports MiB per window, not MB/s.
-#   PID-reuse safety (F5): snapshots record /proc/<pid>/stat starttime
+#   PID-reuse safety : snapshots record /proc/<pid>/stat starttime
 #   (field 22, parsed after the last ')' — comm may contain spaces/parens)
 #   next to the pid; the A/B join requires BOTH to match, and every action
 #   re-reads the live starttime and skips on mismatch — a reused pid drops
@@ -68,13 +68,13 @@
 #   "hint: scheduler is <sched> — ionice demotion is fully binding only under
 #   bfq" line is emitted (once per mitigate.state lifetime, key hint_bfq=1).
 #
-# MITIGATE=2 pendulum (orphan-safe, F7): the intended frozen pid is recorded
+# MITIGATE=2 pendulum (orphan-safe, ): the intended frozen pid is recorded
 # in MSTATE BEFORE kill -STOP; an EXIT/TERM/INT trap SIGCONTs it, and the
 # start of every run SIGCONTs any recorded pid unconditionally — so even a
 # SIGKILLed run heals on the next run. The freeze therefore lasts at most
 # until the end of the run that issued it (bounded, never inter-run).
 #
-# Demotion recovery (F6 + I1/I2): each demoted pid is stored as
+# Demotion recovery (recovery bookkeeping): each demoted pid is stored as
 # "pid:starttime:nice:iclass:iprio:clean" — the recorded nice AND I/O
 # class+level (iclass/iprio, read back via `ionice -p` before demotion)
 # allow an EXACT restore, plus a PER-ENTRY clean counter. On EVERY run each
@@ -159,27 +159,27 @@
 #     children untouched
 #
 #   Self-I/O hygiene (Sep 29 investigation — see reports/benice/):
-#   - F12: kernel_io_errors is counted INCREMENTALLY via journalctl
+#   - kernel_io_errors is counted INCREMENTALLY via journalctl
 #     --cursor-file. The old per-run full scan re-walked ~1 GB of journal
 #     files; cold, that faulted in ~950 MB of page cache (USB SSD read
 #     storm, 84 s runs, recurring "memory peak ~950 MB" systemd reports)
-#   - F13: pid 1 and /system.slice processes are never ranked or demoted —
+#   - pid 1 and /system.slice processes are never ranked or demoted —
 #     /proc/<pid>/io rolls reaped children's I/O into parents, which once
 #     made the valve pick systemd as the "top consumer" (61 services
 #     demoted for 2 minutes on a false signal)
-#   - F14: snap_io is fork-free (bash builtins only). The old cat+awk-per-pid
+#   - snap_io is fork-free (bash builtins only). The old cat+awk-per-pid
 #     helper executed ~3200 times per run: 5.5 s CPU per run → ~0.3 s
-#   - F15: instance lock (flock on $LIB_DIR/beniced.lock) — an overlapping
+#   - instance lock (flock on $LIB_DIR/beniced.lock) — an overlapping
 #     run exits immediately without doing any work; no stacking chains
-#   - F16: KERR_EVERY (default 1) — scan the kernel journal for I/O errors
+#   - KERR_EVERY (default 1) — scan the kernel journal for I/O errors
 #     only every Nth run; each scan mmaps the journal tail (100-200 MB of
 #     clean page cache), production configs can amortize it to 1/5th
-#   - F19: offender/valve ranking by stat field 42 (delayacct_blkio_ticks) —
+#   - offender/valve ranking by stat field 42 (delayacct_blkio_ticks) —
 #     per-process block-I/O WAIT, never inherited from reaped children (the
 #     io-bytes are still reported; the installer enables task delay acct)
-#   - F20: mem_top reports PSS (proportional set size), not RSS — shared
+#   - mem_top reports PSS (proportional set size), not RSS — shared
 #     pages are divided among sharers instead of double-counted
-#   - F21: the kernel-error journal scan is DEFERRED while a storm is
+#   - the kernel-error journal scan is DEFERRED while a storm is
 #     declared (PSI full >= PSI_TRIG) — the watcher stays light when it
 #     matters most; the cursor makes the deferral lossless
 # =============================================================================
@@ -203,7 +203,7 @@ MEM_TRIG=${MEM_TRIG:-40}
 MEM_AVAIL_MIN=${MEM_AVAIL_MIN:-750}
 MITIGATE=${MITIGATE:-1}
 
-# F11: clamp PSI_TRIG to >= 1 so the "0 >= 0" always-true seam is gone
+# clamp PSI_TRIG to >= 1 so the "0 >= 0" always-true seam is gone
 case $PSI_TRIG in ''|*[!0-9]*) PSI_TRIG=25 ;; esac
 [ "$PSI_TRIG" -lt 1 ] && PSI_TRIG=1
 case $IO_TRIG_MBPS in ''|*[!0-9]*) IO_TRIG_MBPS=5 ;; esac
@@ -215,7 +215,7 @@ case $MEM_AVAIL_MIN in ''|*[!0-9]*) MEM_AVAIL_MIN=750 ;; esac
 # ensure runtime dirs exist (self-healing; installer normally creates them)
 mkdir -p "$LOG_DIR" "$LIB_DIR" 2>/dev/null || true
 
-# F15: instance lock — a second beniced (manual run, wrapper loop, a future
+# instance lock — a second beniced (manual run, wrapper loop, a future
 # second timer) must exit immediately without touching anything. flock is
 # atomic, so two simultaneous starts cannot both pass the check (a pgrep
 # test can), and the kernel releases the lock when the holder dies — no
@@ -256,7 +256,7 @@ proc_alive() {       # pid starttime -> true iff pid exists AND starttime matche
 }
 num_ok() { case ${1:-} in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
-# F13: system processes are off-limits for demotion. /proc/<pid>/io rolls the
+# system processes (pid 1, /system.slice) are off-limits for demotion. /proc/<pid>/io rolls the
 # I/O of reaped children into the parent, which makes pid 1 and service
 # managers look like chronic top consumers (Sep 29: the below-threshold valve
 # demoted systemd plus 61 system services on exactly that false signal).
@@ -361,14 +361,14 @@ demoted_has() {      # pid starttime -> true if already on the demoted list
   return 1
 }
 
-# F7: at the start of EVERY run, SIGCONT the previously recorded frozen pid
+# at the start of EVERY run, SIGCONT the previously recorded frozen pid
 # unconditionally (heals a SIGKILLed predecessor run; no-op otherwise).
 if [ "$m_stopped_pid" != "0" ] && proc_alive "$m_stopped_pid" "$m_stopped_start"; then
   kill -CONT "$m_stopped_pid" 2>/dev/null || true
 fi
 m_stopped_pid=0; m_stopped_start=0    # re-recorded below if we freeze someone anew
 
-# F7: safety net — never leave a frozen process behind on exit/TERM/INT
+# safety net — never leave a frozen process behind on exit/TERM/INT
 stopped_pid=0; stopped_start=0
 cleanup() {
   if [ "$stopped_pid" != "0" ]; then
@@ -387,10 +387,10 @@ trap 'exit 143' TERM
 # --- collect GLOBAL counters ---------------------------------------------------
 now=$(date '+%F %T')
 epoch=$(date +%s)
-up_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)  # F9: monotonic clock
+up_now=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)  # monotonic clock
 num_ok "$up_now" || up_now=0
 load1=$(cut -d' ' -f1 /proc/loadavg); load5=$(cut -d' ' -f2 /proc/loadavg); load15=$(cut -d' ' -f3 /proc/loadavg)
-# F12 + F16: kernel I/O errors are counted INCREMENTALLY (cursor-file; the
+# kernel I/O errors are counted incrementally (cursor-file; the
 # old full scan re-walked ~1 GB of journal files, cold-faulting ~950 MB of
 # page cache) and only every KERR_EVERY runs. Each scan still mmaps the
 # journal tail (100-200 MB of clean page cache on this box), so production
@@ -430,11 +430,11 @@ iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=$
 
 # --- I/O per-process snapshot helper -----------------------------------------
 # outputs "pid starttime total_bytes" lines (root can read every process);
-# the starttime column makes the A/B join PID-reuse-proof (F5)
+# the starttime column makes the A/B join PID-reuse-proof 
 snap_io() {
-  # F14: fork-free snapshot. The old helper spawned cat+awk per pid
+  # fork-free snapshot. The old helper spawned cat+awk per pid
   # (~4 execs x ~800 pids per run — the largest CPU/wall cost under load).
-  # F19: output gained a 4th column — stat field 42 (delayacct_blkio_ticks):
+  # the snapshot gained a 4th column — stat field 42 (delayacct_blkio_ticks):
   # per-process block-I/O WAIT that is NOT inherited from reaped children.
   # Output: "pid starttime total_bytes delay_ticks".
   local p pid s rest st dt k v total
@@ -465,7 +465,7 @@ snap_io() {
 }
 TMP_A=$(mktemp) ; TMP_B=$(mktemp)
 
-# F4: bracket the sampling window so the offender threshold is time-normalized
+# bracket the sampling window so the offender threshold is time-normalized
 win_start=$(date +%s)
 snap_io > "$TMP_A"
 
@@ -474,7 +474,7 @@ psi_max_some=0; psi_max_full=0
 psi_mem_max_some=0; psi_mem_max_full=0; mem_avail_min_kb=9999999
 psi_ok=1
 if [ ! -r /proc/pressure/io ]; then
-  psi_ok=0    # F1: stall detection inactive — say so, loudly
+  psi_ok=0    # stall detection inactive — say so, loudly
   echo "beniced: PSI unavailable — stall detection inactive (see README Prerequisites)" >&2
 else
   waited=0
@@ -499,7 +499,7 @@ fi
 [ "$mem_avail_min_kb" -eq 9999999 ] && mem_avail_min_kb=0   # meminfo unreadable
 mem_avail_mb=$(( mem_avail_min_kb / 1024 ))
 # top-3 RSS processes right now — the "who is eating the RAM" snapshot
-# F20: report PSS (proportional set size) instead of RSS — RSS double-counts
+# report PSS (proportional set size) instead of RSS — RSS double-counts
 # shared pages, so identical-library processes look like separate hogs.
 # (pid:comm:MB triplets, same pid:comm shape as the offenders: entries)
 mem_top=$(ps -eo pid=,pss=,comm= --sort=-pss 2>/dev/null | awk 'NR<=3 && $2>1024 {printf "%s%s:%s:%dM", s2, $1, $3, $2/1024; s2=","}')
@@ -508,11 +508,11 @@ win_end=$(date +%s)
 win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1
 
 # --- offender ranking over the window (global, process-level) -----------------
-# join requires pid AND starttime to match — a reused pid drops out (F5)
-# F19: rank by stat field 42 (delayacct_blkio_ticks) — per-process block-I/O
+# join requires pid AND starttime to match — a reused pid drops out 
+# Rank by stat field 42 (delayacct_blkio_ticks) — per-process block-I/O
 # WAIT, never inherited from reaped children. Primary key: delay delta;
 # tiebreak: io-bytes delta (which alone made systemd and build shells look
-# like top consumers — see F13). With task_delayacct=0 every delay delta is
+# like top consumers — see the system-process guard above). With task_delayacct=0 every delay delta is
 # zero and the tiebreak degrades gracefully to the old bytes ranking.
 tops=$(awk 'NR==FNR{a[$1]=$3; d[$1]=$4; st[$1]=$2; next}
             ($1 in a) && ($2 == st[$1]) {
@@ -522,7 +522,7 @@ tops=$(awk 'NR==FNR{a[$1]=$3; d[$1]=$4; st[$1]=$2; next}
               if (db > 0 || dd > 0) printf "%d %d %s:%s\n", dd, db, $1, $2}' \
        "$TMP_A" "$TMP_B" | sort -k1,1rn -k2,2rn | head -3)
 
-# F13: drop PID 1 and system.slice processes from the ranking — /proc/<pid>/io
+# drop PID 1 and system.slice processes from the ranking — /proc/<pid>/io
 # rolls reaped children's I/O into the parent, so systemd (pid 1) and build
 # orchestrators always LOOK like top consumers. System services are the
 # unit/slice layer's job; benice demotes user workloads only.
@@ -538,7 +538,7 @@ trig=0
 fs_err_of() {
   local dev=$1 total=0 pcnt f
   for pcnt in $(ls "/sys/block/$dev" 2>/dev/null | grep "^$dev"); do
-    for f in /sys/fs/*/"$pcnt"/errors_count; do     # F2: no literal \" escapes
+    for f in /sys/fs/*/"$pcnt"/errors_count; do     # no literal \" escapes
       [ -r "$f" ] && total=$(( total + $(cat "$f" 2>/dev/null || echo 0) ))
     done
   done
@@ -554,7 +554,7 @@ any_warn=0
 for dev in $DISKS; do
 
   if [ ! -d "/sys/block/$dev" ]; then
-    # F10: the ALERT context travels on the line itself — never a bare ALERT
+    # the ALERT context travels on the line itself — never a bare ALERT
     miss_alerts="MISSING_DEV"
     [ "$psi_ok" -eq 0 ] && miss_alerts="MISSING_DEV MISSING_PSI"
     line=$(printf '%s dev=%s status=MISSING alerts="%s"' "$now" "$dev" "$miss_alerts")
@@ -575,7 +575,7 @@ for dev in $DISKS; do
   alerts=""
   busy_delta=0
   if [ -f "$sfile" ]; then
-    # F9: 6 fields since the uptime column; old 5-field files use epoch fallback
+    # 6 fields since the uptime column; old 5-field files use epoch fallback
     read -r -a srow < "$sfile" 2>/dev/null || srow=()
     if [ "${#srow[@]}" -ge 6 ] && num_ok "${srow[1]}"; then
       p_epoch=${srow[0]}; p_up=${srow[1]}; p_io=${srow[2]}
@@ -594,7 +594,7 @@ for dev in $DISKS; do
       wall_s=$(( epoch - p_epoch ))     # legacy fallback
     fi
     [ "$wall_s" -lt 1 ] && wall_s=1
-    busy_delta=$(( io_ms > p_io ? io_ms - p_io : 0 ))   # F3: real delta
+    busy_delta=$(( io_ms > p_io ? io_ms - p_io : 0 ))   # real delta
     util_pct=$(( busy_delta * 100 / (wall_s * 1000) ))
     [ "$util_pct" -gt 100 ] && util_pct=100
     d_rd=$(( rd > p_rd ? rd - p_rd : 0 ))
@@ -620,7 +620,7 @@ for dev in $DISKS; do
      || { [ "$mem_avail_min_kb" -gt 0 ] && [ "$mem_avail_min_kb" -le $(( MEM_AVAIL_MIN * 1024 )) ]; }; then
     alerts="${alerts:+$alerts }MEM_HIGH=some=${psi_mem_max_some}% avail=${mem_avail_mb}MB"; status=WARN
   fi
-  # F1: PSI missing → WARN + MISSING_PSI on every emitted line
+  # PSI missing → WARN + MISSING_PSI on every emitted line
   if [ "$psi_ok" -eq 0 ]; then
     alerts="${alerts:+$alerts }MISSING_PSI"; status=WARN
   fi
@@ -635,7 +635,7 @@ done
 # --- offender reporting (global, process-level) -------------------------------
 off_list=""; act=""; hint_line=""
 restored_lines=()
-min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 * win_s ))   # F4: MiB per window
+min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 * win_s ))   # MiB per window
 reported=0
 if [ "$trig" -eq 1 ]; then
   while read -r dly dby pentry; do
@@ -643,7 +643,7 @@ if [ "$trig" -eq 1 ]; then
     [ "$dby" -lt "$min_bytes" ] && continue
     [ -r "/proc/$pid/comm" ] || continue
     mb=$(( dby / (1024 * 1024) ))
-    comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')  # F8
+    comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')  # 
     off_list="${off_list:+$off_list }off$((reported+1))=${pid}:${comm_name}:${mb}MiB"
     reported=$((reported + 1))
   done <<EOF
@@ -672,7 +672,7 @@ EOF
   fi
 fi
 
-# --- per-entry recovery counters (F6/I2): tick EVERY recorded entry, every run
+# --- per-entry recovery counters (/I2): tick EVERY recorded entry, every run
 # (a re-offender resets to 0; a demoted pid that stays out of this run's tops
 # set earns one more clean run — covering triggered and clean runs alike; the
 # old single global clean counter let a chronic offender hold a one-time
@@ -693,7 +693,7 @@ for entry in ${m_demoted:-}; do
 done
 m_demoted=$m_demoted_new
 
-# --- demotion recovery (F6/I1): per-entry — restore at clean>=2 REGARDLESS of
+# --- demotion recovery (/I1): per-entry — restore at clean>=2 REGARDLESS of
 # the global trigger, renice+ionice EXACTLY to the recorded values
 keep=""
 for entry in ${m_demoted:-}; do
@@ -748,10 +748,10 @@ if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
     pid=${pentry%%:*}; pstart=${pentry##*:}
     [ "$pid" -le 2 ] && continue
     [ "$dby" -lt "$min_bytes" ] && [ "$pid" != "$valve_pid" ] && continue
-    proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
+    proc_alive "$pid" "$pstart" || continue    # pid-reuse re-check
     [ -r "/proc/$pid/comm" ] || continue
     if [ "$MITIGATE" -ge 1 ]; then
-      # F6/I1: remember the original nice AND I/O class+level once, so the
+      # /I1: remember the original nice AND I/O class+level once, so the
       # demotion can be undone exactly; the entry starts its per-entry
       # clean counter at 0 (I2)
       if ! demoted_has "$pid" "$pstart"; then
@@ -787,7 +787,7 @@ if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
     if [ "$MITIGATE" -ge 2 ]; then
       stopped_pid=$pid; stopped_start=$pstart
       m_stopped_pid=$pid; m_stopped_start=$pstart
-      mstate_write                             # F7: record BEFORE the STOP
+      mstate_write                             # record BEFORE the STOP
       kill -STOP "$pid" 2>/dev/null || {
         stopped_pid=0; stopped_start=0; m_stopped_pid=0; m_stopped_start=0
         mstate_write                       # revert the pre-STOP record

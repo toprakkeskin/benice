@@ -237,6 +237,23 @@ beniced watches I/O — it must not become an I/O problem itself:
   immediately without work if it is already held. Atomic — two simultaneous
   starts cannot both pass — and the lock is released by the kernel when the
   holder dies, so stale locks cannot pile up.
+- **F16 — KERR_EVERY:** run the kernel error scan every Nth run (config,
+  default 1). `kernel_io_errors` then trails by up to N minutes.
+- **F19 — delay-based ranking:** offenders and the valve rank by stat field 42
+  (`delayacct_blkio_ticks` — per-process block-I/O wait), NOT by io bytes.
+  `/proc/<pid>/io` rolls reaped children's I/O into the parent, so byte-based
+  ranking made systemd and build shells look like chronic offenders; delay
+  ticks are per-process and immune to that. Io bytes stay reported (offN MiB)
+  and serve as the qualifying gate; the installer enables
+  `kernel.task_delayacct=1`. With delay accounting off the ranking degrades
+  gracefully to the old bytes ordering.
+- **F20 — PSS in mem_top:** the mem_top triplets now report proportional set
+  size (shared pages divided among sharers) instead of RSS (shared pages
+  double-counted). Same `pid:comm:MB` format.
+- **F21 — storm deferral:** when a run closes with `psi_io_full_max >=
+  PSI_TRIG`, the kernel-error journal scan is deferred to the next calm run.
+  The cursor makes this lossless. The watcher stays light during exactly the
+  windows it exists to watch.
 
 ## Reading the log
 

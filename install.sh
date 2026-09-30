@@ -257,6 +257,17 @@ bfq_step() {
 bfq_step
 # ------------------------------------------------------- end BFQ scheduler step
 
+# ------------------- task delay accounting (F19) ---------------------------
+# offender ranking ranks by stat field 42 (delayacct_blkio_ticks); the
+# counter stays 0 unless delay accounting is on. Idempotent: only writes
+# when the current value differs. Runtime switch + persistent conf.
+DA_CONF=/etc/sysctl.d/91-benice-delayacct.conf
+if [ "$(cat /proc/sys/kernel/task_delayacct 2>/dev/null || echo 0)" != "1" ]; then
+  echo "==> enabling kernel task delay accounting ($DA_CONF)"
+  printf 'kernel.task_delayacct = 1\n' > "$DA_CONF"
+  sysctl -w kernel.task_delayacct=1 >/dev/null 2>&1 || true
+fi
+
 # ---------------------------------------------------------------- step 5
 # -------- 4c. memory guardrails on the user slice (ask-to-apply) -------------
 # Sep-28 stability round: put a soft/hard memory cap on user-1000.slice so a

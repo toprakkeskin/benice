@@ -174,6 +174,14 @@
 #   - F16: KERR_EVERY (default 1) — scan the kernel journal for I/O errors
 #     only every Nth run; each scan mmaps the journal tail (100-200 MB of
 #     clean page cache), production configs can amortize it to 1/5th
+#   - F19: offender/valve ranking by stat field 42 (delayacct_blkio_ticks) —
+#     per-process block-I/O WAIT, never inherited from reaped children (the
+#     io-bytes are still reported; the installer enables task delay acct)
+#   - F20: mem_top reports PSS (proportional set size), not RSS — shared
+#     pages are divided among sharers instead of double-counted
+#   - F21: the kernel-error journal scan is DEFERRED while a storm is
+#     declared (PSI full >= PSI_TRIG) — the watcher stays light when it
+#     matters most; the cursor makes the deferral lossless
 # =============================================================================
 set -u
 CONF="/etc/benice/benice.conf"
@@ -426,18 +434,21 @@ iowait_pct=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $16}'); iowait_pct=$
 snap_io() {
   # F14: fork-free snapshot. The old helper spawned cat+awk per pid
   # (~4 execs x ~800 pids per run — the largest CPU/wall cost under load).
-  # Output is unchanged: "pid starttime total_bytes".
-  local p pid s rest st k v total
+  # F19: output gained a 4th column — stat field 42 (delayacct_blkio_ticks):
+  # per-process block-I/O WAIT that is NOT inherited from reaped children.
+  # Output: "pid starttime total_bytes delay_ticks".
+  local p pid s rest st dt k v total
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     [ "$pid" = "$$" ] && continue
     [ "$pid" -le 2 ] && continue          # skip PID 1 and kernel threads
-    st=""
+    st=""; dt=0
     if IFS= read -r s 2>/dev/null < "$p/stat"; then   # NB: silence BEFORE open — pids vanish between the glob and this read (line-400 journal spam)
       rest=${s##*) }                      # comm may contain spaces/parens
       # shellcheck disable=SC2086  # intentional word split on stat fields
       set -- ${rest}
-      st=${20:-}                          # NB: braced — $20 would mean ${2}+"0"
+      st=${20:-}                          # NB: braced — $20 would mean ${2}+"0"  (field 22)
+      dt=${40:-0}                         # field 42 = delayacct_blkio_ticks
     fi
     [ -n "$st" ] || continue
     total=0
@@ -449,7 +460,7 @@ snap_io() {
         read_bytes:|write_bytes:) total=$(( total + ${v:-0} )) ;;
       esac
     done 2>/dev/null < "$p/io" || continue
-    [ "$total" -gt 0 ] && printf '%s %s %s\n' "$pid" "$st" "$total"
+    [ "$total" -gt 0 ] && printf '%s %s %s %s\n' "$pid" "$st" "$total" "$dt"
   done
 }
 TMP_A=$(mktemp) ; TMP_B=$(mktemp)
@@ -488,26 +499,37 @@ fi
 [ "$mem_avail_min_kb" -eq 9999999 ] && mem_avail_min_kb=0   # meminfo unreadable
 mem_avail_mb=$(( mem_avail_min_kb / 1024 ))
 # top-3 RSS processes right now — the "who is eating the RAM" snapshot
+# F20: report PSS (proportional set size) instead of RSS — RSS double-counts
+# shared pages, so identical-library processes look like separate hogs.
 # (pid:comm:MB triplets, same pid:comm shape as the offenders: entries)
-mem_top=$(ps -eo pid=,rss=,comm= --sort=-rss 2>/dev/null | awk 'NR<=3 && $2>1024 {printf "%s%s:%s:%dM", s2, $1, $3, $2/1024; s2=","}')
+mem_top=$(ps -eo pid=,pss=,comm= --sort=-pss 2>/dev/null | awk 'NR<=3 && $2>1024 {printf "%s%s:%s:%dM", s2, $1, $3, $2/1024; s2=","}')
 snap_io > "$TMP_B"
 win_end=$(date +%s)
 win_s=$((win_end - win_start)); [ "$win_s" -lt 1 ] && win_s=1
 
 # --- offender ranking over the window (global, process-level) -----------------
 # join requires pid AND starttime to match — a reused pid drops out (F5)
-tops=$(awk 'NR==FNR{a[$1]=$3; st[$1]=$2; next}
-            ($1 in a) && ($2 == st[$1]) {d=$3-a[$1]; if(d>0) printf "%d %s:%s\n", d, $1, $2}' \
-       "$TMP_A" "$TMP_B" | sort -rn | head -3)
+# F19: rank by stat field 42 (delayacct_blkio_ticks) — per-process block-I/O
+# WAIT, never inherited from reaped children. Primary key: delay delta;
+# tiebreak: io-bytes delta (which alone made systemd and build shells look
+# like top consumers — see F13). With task_delayacct=0 every delay delta is
+# zero and the tiebreak degrades gracefully to the old bytes ranking.
+tops=$(awk 'NR==FNR{a[$1]=$3; d[$1]=$4; st[$1]=$2; next}
+            ($1 in a) && ($2 == st[$1]) {
+              db=$3-a[$1]; dd=$4-d[$1];
+              if (db < 0) db = 0;
+              if (dd < 0) dd = 0;
+              if (db > 0 || dd > 0) printf "%d %d %s:%s\n", dd, db, $1, $2}' \
+       "$TMP_A" "$TMP_B" | sort -k1,1rn -k2,2rn | head -3)
 
 # F13: drop PID 1 and system.slice processes from the ranking — /proc/<pid>/io
 # rolls reaped children's I/O into the parent, so systemd (pid 1) and build
 # orchestrators always LOOK like top consumers. System services are the
 # unit/slice layer's job; benice demotes user workloads only.
-tops=$(printf '%s\n' "$tops" | while read -r d pentry; do
-  [ -n "$d" ] || continue
+tops=$(printf '%s\n' "$tops" | while read -r dly dby pentry; do
+  [ -n "$dly" ] || continue
   if sys_proc "${pentry%%:*}"; then continue; fi
-  printf '%s %s\n' "$d" "$pentry"
+  printf '%s %s %s\n' "$dly" "$dby" "$pentry"
 done)
 trig=0
 [ "$psi_max_full" -ge "$PSI_TRIG" ] && trig=1
@@ -616,11 +638,11 @@ restored_lines=()
 min_bytes=$(( IO_TRIG_MBPS * 1024 * 1024 * win_s ))   # F4: MiB per window
 reported=0
 if [ "$trig" -eq 1 ]; then
-  while read -r d pentry; do
+  while read -r dly dby pentry; do
     pid=${pentry%%:*}; pstart=${pentry##*:}
-    [ "$d" -lt "$min_bytes" ] && continue
+    [ "$dby" -lt "$min_bytes" ] && continue
     [ -r "/proc/$pid/comm" ] || continue
-    mb=$(( d / (1024 * 1024) ))
+    mb=$(( dby / (1024 * 1024) ))
     comm_name=$(cat "/proc/$pid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')  # F8
     off_list="${off_list:+$off_list }off$((reported+1))=${pid}:${comm_name}:${mb}MiB"
     reported=$((reported + 1))
@@ -636,12 +658,13 @@ fi
 # candidate by definition (Sep 28: PSI full=26% with zero demotions).
 valve_pid=""
 if [ "$trig" -eq 1 ] && [ "$reported" -eq 0 ]; then
-  read -r vd vpentry <<EOF
+  read -r vd vdb vpentry <<EOF
 $tops
 EOF
   vpid=${vpentry%%:*}
-  if [ -n "$vd" ] && [ "$vd" -gt 0 ] && [ "$vpid" -gt 2 ] && [ -r "/proc/$vpid/comm" ]; then
-    vmb=$(( vd / (1024 * 1024) ))
+  if [ -n "$vd" ] && { [ "$vd" -gt 0 ] || [ "$vdb" -gt 0 ]; } \
+     && [ "$vpid" -gt 2 ] && [ -r "/proc/$vpid/comm" ]; then
+    vmb=$(( vdb / (1024 * 1024) ))
     vcomm=$(cat "/proc/$vpid/comm" 2>/dev/null | tr -cd '[:alnum:]._-')
     off_list="off1=${vpid}:${vcomm}:${vmb}MiB"
     reported=1
@@ -654,7 +677,7 @@ fi
 # set earns one more clean run — covering triggered and clean runs alike; the
 # old single global clean counter let a chronic offender hold a one-time
 # victim hostage, per-entry counters restore the victim on its own merits)
-tops_keys=$(printf '%s\n' "$tops" | awk 'NF{print $2}' | tr '\n' ' ')
+tops_keys=$(printf '%s\n' "$tops" | awk 'NF{print $3}' | tr '\n' ' ')
 m_demoted_new=""
 for entry in ${m_demoted:-}; do
   demoted_parse "$entry"
@@ -721,10 +744,10 @@ if [ "$trig" -eq 1 ] && [ "$MITIGATE" -ge 1 ] && [ "$reported" -gt 0 ]; then
     read -r _ pp _ <<<"$rest"
     printf '%s %s\n' "$pp" "$p"
   done 2>/dev/null)
-  while read -r d pentry; do
+  while read -r dly dby pentry; do
     pid=${pentry%%:*}; pstart=${pentry##*:}
     [ "$pid" -le 2 ] && continue
-    [ "$d" -lt "$min_bytes" ] && [ "$pid" != "$valve_pid" ] && continue
+    [ "$dby" -lt "$min_bytes" ] && [ "$pid" != "$valve_pid" ] && continue
     proc_alive "$pid" "$pstart" || continue    # F5: pid-reuse re-check
     [ -r "/proc/$pid/comm" ] || continue
     if [ "$MITIGATE" -ge 1 ]; then

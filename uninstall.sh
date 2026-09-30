@@ -4,7 +4,8 @@
 #
 # Usage:
 #   sudo ./uninstall.sh           # stop + disable + remove units, binary,
-#                                 # the logrotate stanza and the BFQ udev rule
+#                                 # the logrotate stanza, the BFQ udev rule
+#                                 # and the task-delay-accounting conf
 #   sudo ./uninstall.sh --purge   # ALSO delete central config, logs, state
 # =============================================================================
 set -euo pipefail
@@ -31,6 +32,16 @@ rm -f /etc/logrotate.d/benice
 
 echo "==> removing udev rule (BFQ persistence)"
 rm -f /etc/udev/rules.d/61-benice-bfq.rules
+
+echo "==> removing task delay accounting conf (F19)"
+DA_CONF=/etc/sysctl.d/91-benice-delayacct.conf
+if [[ -f $DA_CONF ]]; then
+  rm -f "$DA_CONF"
+  sysctl -w kernel.task_delayacct=0 >/dev/null 2>&1 || true
+  echo "    removed; runtime value restored to 0"
+else
+  echo "    not present — nothing to remove"
+fi
 
 echo "==> checking memory guardrails drop-in"
 GUARD_DST=/etc/systemd/system/user-1000.slice.d/memory-limits.conf

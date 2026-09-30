@@ -244,9 +244,9 @@ beniced watches I/O — it must not become an I/O problem itself:
   `/proc/<pid>/io` rolls reaped children's I/O into the parent, so byte-based
   ranking made systemd and build shells look like chronic offenders; delay
   ticks are per-process and immune to that. Io bytes stay reported (offN MiB)
-  and serve as the qualifying gate; the installer enables
-  `kernel.task_delayacct=1`. With delay accounting off the ranking degrades
-  gracefully to the old bytes ordering.
+  and serve as the qualifying gate; the installer ASKS to enable
+  `kernel.task_delayacct=1` (kernel-wide setting — never silent). With delay
+  accounting off the ranking degrades gracefully to the old bytes ordering.
 - **F20 — PSS in mem_top:** the mem_top triplets now report proportional set
   size (shared pages divided among sharers) instead of RSS (shared pages
   double-counted). Same `pid:comm:MB` format.

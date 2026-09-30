@@ -18,6 +18,10 @@
 #   4c. optionally applies memory guardrails on the interactive user slice
 #       (MemoryHigh/MemoryMax, defaults 6G/7G — asks first; uninstall.sh
 #       detects them and offers to remove)
+#   4d. asks to enable kernel task delay accounting (kernel.task_delayacct=1,
+#       the per-process I/O-wait input for F19 offender ranking — a
+#       kernel-wide setting, so never applied silently; uninstall.sh removes
+#       the conf it wrote and restores 0)
 #   5. installs systemd units (system-wide, user-independent) and enables
 #      the one-minute timer
 #
@@ -257,15 +261,31 @@ bfq_step() {
 bfq_step
 # ------------------------------------------------------- end BFQ scheduler step
 
-# ------------------- task delay accounting (F19) ---------------------------
+# ------------------- task delay accounting (F19, ask-to-enable) -------------
 # offender ranking ranks by stat field 42 (delayacct_blkio_ticks); the
-# counter stays 0 unless delay accounting is on. Idempotent: only writes
-# when the current value differs. Runtime switch + persistent conf.
+# counter stays 0 unless delay accounting is on. Ask-to-enable: this is a
+# KERNEL-WIDE setting and must never be applied silently. Idempotent;
+# uninstall.sh removes the conf and restores 0.
 DA_CONF=/etc/sysctl.d/91-benice-delayacct.conf
-if [ "$(cat /proc/sys/kernel/task_delayacct 2>/dev/null || echo 0)" != "1" ]; then
-  echo "==> enabling kernel task delay accounting ($DA_CONF)"
-  printf 'kernel.task_delayacct = 1\n' > "$DA_CONF"
-  sysctl -w kernel.task_delayacct=1 >/dev/null 2>&1 || true
+cur_da=$(cat /proc/sys/kernel/task_delayacct 2>/dev/null || echo 0)
+if [ "$cur_da" != "1" ]; then
+  da_ans=""
+  if [ -t 0 ]; then
+    read -rp "Enable kernel task delay accounting so storm offenders are ranked by their own I/O wait (kernel-wide setting)? [y/N] " da_ans || da_ans=""
+  else
+    echo "    non-interactive session — task delay accounting NOT enabled"
+    echo "    (F19 ranking falls back to I/O-byte deltas; enable later with:"
+    echo "     echo 'kernel.task_delayacct = 1' | sudo tee $DA_CONF && sudo sysctl -w kernel.task_delayacct=1)"
+  fi
+  if [[ $da_ans =~ ^[Yy] ]]; then
+    echo "==> enabling kernel task delay accounting ($DA_CONF)"
+    printf 'kernel.task_delayacct = 1\n' > "$DA_CONF"
+    sysctl -w kernel.task_delayacct=1 >/dev/null 2>&1 || true
+  else
+    echo "    skipped — offender ranking degrades to I/O-byte deltas (F19 fallback)"
+  fi
+else
+  echo "==> task delay accounting already enabled (kernel.task_delayacct=1)"
 fi
 
 # ---------------------------------------------------------------- step 5

@@ -43,11 +43,14 @@ Every minute the timer fires and `beniced` does this:
 2. Samples PSI (`/proc/pressure/io`) for 30 seconds. PSI is the kernel's own
    meter of how many tasks are stuck waiting for I/O. This is the single most
    honest number on the box.
-3. Snapshots per-process I/O (`/proc/<pid>/io`) before and after that window
-   and diffs them. Whatever ate the most bytes is your suspect.
-4. If the pressure crossed the threshold, the top consumers are written to the
-   log (`off1=4242:chromium:87MiB` — bytes accumulated over the window, not a
-   rate) and — if mitigation is on — demoted with `ionice -c3` and `renice 19`.
+3. Snapshots per-process I/O (`/proc/<pid>/io`) AND per-process block-I/O
+   wait (`/proc/<pid>/stat` field 42, delay ticks) before and after that
+   window, and diffs both. Ranking is by the delay delta — the I/O time a
+   process waited for itself, which dead children cannot inflate — while
+   the byte delta qualifies the candidate.
+4. If the pressure crossed the threshold, the top consumers are written to
+   the log (`off1=4242:chromium:87MiB` — bytes accumulated over the window,
+   not a rate) and — if mitigation is on — demoted with `ionice -c3` and `renice 19`.
    The offenders keep running. They just lose every queue they are standing
    in, temporarily: their original nice is recorded before the demotion, and
    once the disk has stayed calm for two consecutive runs the nice is given
@@ -89,10 +92,10 @@ And one run, end to end:
 
     systemd timer (every 1 min)
       └─▶ beniced run
-          ├─ snapshot A: per-process I/O + start times
+          ├─ snapshot A: per-process I/O + start times + delay ticks
           ├─ sample PSI for 30 s
           ├─ snapshot B
-          ├─ rank processes by I/O delta over the window
+          ├─ rank processes by their own I/O-wait (delay ticks); bytes qualify
           ├─ PSI full >= threshold?
           │     yes ─▶ report offenders, demote top set (record originals)
           │     no  ─▶ tick clean counters, restore whoever reached 2
@@ -210,50 +213,117 @@ sourced fresh every time, no restart needed.
 | `MEM_TRIG` / `MEM_AVAIL_MIN` | `40` / `750` | memory-pressure alert threshold (%) / MemAvailable floor (MiB) that raise `MEM_HIGH` |
 | `MITIGATE` | `1` | 0 observe only · 1 demote · 2 also freeze; demotions are undone after 2 clean runs |
 
-## Self-I/O hygiene (F12–F14)
+## Self-I/O hygiene and ranking internals (F12–F21)
 
-beniced watches I/O — it must not become an I/O problem itself:
+beniced watches I/O — it must not become an I/O problem itself, and its
+verdicts must not be built on polluted counters. Each fix is collapsed;
+open the ones you care about.
 
-- **F12 — incremental error counting:** kernel I/O errors are counted with
-  `journalctl --cursor-file`, so each run reads only lines newer than the
-  previous run. The old full-journal scan re-walked ~1 GB of journal files
-  per run; with a cold page cache that faulted in ~950 MB on the USB SSD
-  (84-second runs, recurring ~950 MB "memory peak" — clean page cache, but
-  a real read storm). First run after boot keeps the old since-boot count.
-  `KERR_EVERY` (config, default 1) runs the scan only every Nth run when its
-  page-cache cost needs amortizing (kernel_io_errors then trails by up to N
-  minutes; `fs_errors` from /sys stay per-run).
-- **F13 — system processes are off-limits:** PID 1 and every process under
-  `/system.slice` are excluded from offender ranking, the below-threshold
-  valve, and demotion. `/proc/<pid>/io` rolls reaped children's I/O into the
-  parent, so systemd and build orchestrators always LOOK like top consumers —
-  on 2026-09-29 the valve demoted systemd plus 61 system services on exactly
-  that false signal (auto-restored after 2 clean runs).
-- **F14 — fork-free snapshot:** the per-process I/O snapshot uses bash
-  builtins only. The old helper forked `cat` + `awk` per PID (~3200 execs per
-  run): measured 5.5 s CPU per run → 0.3 s after the fix.
-- **F15 — instance lock:** an overlapping beniced (manual run, wrapper loop,
-  a second timer) takes an `flock` on `/var/lib/benice/beniced.lock` and exits
-  immediately without work if it is already held. Atomic — two simultaneous
-  starts cannot both pass — and the lock is released by the kernel when the
-  holder dies, so stale locks cannot pile up.
-- **F16 — KERR_EVERY:** run the kernel error scan every Nth run (config,
-  default 1). `kernel_io_errors` then trails by up to N minutes.
-- **F19 — delay-based ranking:** offenders and the valve rank by stat field 42
-  (`delayacct_blkio_ticks` — per-process block-I/O wait), NOT by io bytes.
-  `/proc/<pid>/io` rolls reaped children's I/O into the parent, so byte-based
-  ranking made systemd and build shells look like chronic offenders; delay
-  ticks are per-process and immune to that. Io bytes stay reported (offN MiB)
-  and serve as the qualifying gate; the installer ASKS to enable
-  `kernel.task_delayacct=1` (kernel-wide setting — never silent). With delay
-  accounting off the ranking degrades gracefully to the old bytes ordering.
-- **F20 — PSS in mem_top:** the mem_top triplets now report proportional set
-  size (shared pages divided among sharers) instead of RSS (shared pages
-  double-counted). Same `pid:comm:MB` format.
-- **F21 — storm deferral:** when a run closes with `psi_io_full_max >=
-  PSI_TRIG`, the kernel-error journal scan is deferred to the next calm run.
-  The cursor makes this lossless. The watcher stays light during exactly the
-  windows it exists to watch.
+<details>
+<summary><b>F12 — incremental error counting</b> · journal reads without the read storm</summary>
+
+Kernel I/O errors are counted with `journalctl --cursor-file`, so each run
+reads only lines newer than the previous run. The old full-journal scan
+re-walked ~1 GB of journal files per run; with a cold page cache that
+faulted in ~950 MB on the USB SSD (84-second runs, recurring ~950 MB
+"memory peak" — clean page cache, but a real read storm). First run after
+boot keeps the old since-boot count.
+
+</details>
+
+<details>
+<summary><b>F13 — system processes are off-limits</b> · the valve once demoted systemd</summary>
+
+PID 1 and every process under `/system.slice` are excluded from offender
+ranking, the below-threshold valve, and demotion. `/proc/<pid>/io` rolls
+reaped children's I/O into the parent, so systemd and build orchestrators
+always LOOK like top consumers — on 2026-09-29 the valve demoted systemd
+plus 61 system services on exactly that false signal (auto-restored after
+2 clean runs).
+
+</details>
+
+<details>
+<summary><b>F14 — fork-free snapshot</b> · 5.5 s → 0.3 s CPU per run</summary>
+
+The per-process I/O snapshot uses bash builtins only. The old helper forked
+`cat` + `awk` per PID (~3200 execs per run): measured 5.5 s CPU per run.
+
+</details>
+
+<details>
+<summary><b>F15 — instance lock</b> · overlapping runs exit in milliseconds</summary>
+
+An overlapping beniced (manual run, wrapper loop, a second timer) takes an
+`flock` on `/var/lib/benice/beniced.lock` and exits immediately without
+work if it is already held. Atomic — two simultaneous starts cannot both
+pass — and the kernel releases the lock when the holder dies, so stale
+locks cannot pile up. systemd already serializes the timer's own unit;
+this covers manual runs and extra scheduling sources.
+
+</details>
+
+<details>
+<summary><b>F16 — KERR_EVERY</b> · amortize the journal scan</summary>
+
+Config (default 1): run the kernel error scan every Nth run. See the
+Configuration table.
+
+</details>
+
+<details>
+<summary><b>F19 — delay-based ranking</b> · bytes lie, I/O-wait doesn't</summary>
+
+Offenders and the valve rank by stat field 42
+(`delayacct_blkio_ticks` — per-process block-I/O wait), NOT by io bytes.
+Byte deltas inherit reaped children's I/O, which is why the ranking once
+accused systemd and build shells (see F13). io bytes stay reported (offN
+MiB) and remain the qualifying gate. With delay accounting off the ranking
+degrades gracefully to the old bytes ordering.
+
+<details>
+<summary>kernel knob: <code>task_delayacct</code> (what the installer asks about)</summary>
+
+Field 42 stays 0 forever unless the kernel accumulates delay statistics:
+
+```bash
+cat /proc/sys/kernel/task_delayacct    # 0 = off (distro default), 1 = on
+sudo ./install.sh                      # asks [y/N]; writes a sysctl.d conf
+                                       # + applies it at runtime
+# manual, if you skipped it and change your mind:
+echo 'kernel.task_delayacct = 1' | sudo tee /etc/sysctl.d/91-benice-delayacct.conf
+sudo sysctl -w kernel.task_delayacct=1
+```
+
+Fine print, measured on this box (kernel 6.18, runtime toggle):
+
+- field 42 counts BLOCK-I/O wait only — CPU-bound processes are
+  legitimately 0, and buffered writes do not tick until the final sync
+- the runtime sysctl works: system-wide delay counters grew +3 871 ticks
+  during a measured 25 s I/O burst
+- the kernel command line offers the same switch (`delayacct`), mainly for
+  boxes that want it on before userspace starts
+
+</details>
+</details>
+
+<details>
+<summary><b>F20 — PSS in mem_top</b> · honest memory triplets</summary>
+
+The mem_top triplets report proportional set size (shared pages divided
+among sharers) instead of RSS (shared pages double-counted). Same
+`pid:comm:MB` format.
+
+</details>
+
+<details>
+<summary><b>F21 — storm deferral</b> · the watcher stays light when it matters</summary>
+
+When a run closes with `psi_io_full_max >= PSI_TRIG`, the kernel-error
+journal scan is deferred to the next calm run. The cursor makes this
+lossless.
+
+</details>
 
 ## Reading the log
 
@@ -266,7 +336,9 @@ beniced watches I/O — it must not become an I/O problem itself:
 Most of it is standard iostat vocabulary. The interesting bits: `util_pct` is
 how much of the interval the disk was busy; `psi_io_full_max` is the peak
 percentage of time tasks were *blocked* on I/O — if that climbs and
-`status=WARN` appears, the run names the culprit.
+`status=WARN` appears, the run names the culprit. The `mem_top=…` triplets
+report PSS — proportional memory, with shared pages split among sharers
+(F20): what each process really costs, not what it merely maps.
 
 When the pressure threshold trips, the offending runs get their own lines:
 
